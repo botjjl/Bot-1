@@ -289,8 +289,70 @@ const Jupiter = {
     const swapTxBuf = Buffer.from(swapResp.swapTransaction, 'base64');
     let txid = '';
     try {
-      const blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight = quote?.blockhashWithExpiryBlockHeight || (await connection.getLatestBlockhashAndContext('confirmed')).value;
-      const txResult = await transactionSenderAndConfirmationWaiter({ connection, serializedTransaction: swapTxBuf, blockhashWithExpiryBlockHeight });
+      // Attempt to sign, simulate and send the swap transaction robustly (mirror buy flow)
+      let signedBuf = swapTxBuf;
+      try {
+        // try VersionedTransaction
+        try {
+          const vt = VersionedTransaction.deserialize(signedBuf);
+          vt.sign([keypair]);
+          signedBuf = vt.serialize();
+        } catch (_e) {
+          // fallback to legacy Transaction
+          try {
+            const legacy = Transaction.from(signedBuf);
+            legacy.sign(keypair);
+            signedBuf = legacy.serialize();
+          } catch (__e) {
+            // leave unsigned if unable to parse
+          }
+        }
+      } catch (signErr) {
+        console.warn('[Jupiter][sell] signing warning:', signErr);
+      }
+
+      // simulate before sending
+      try {
+        let txObj: any;
+        try { txObj = VersionedTransaction.deserialize(signedBuf); } catch (_) { txObj = Transaction.from(signedBuf); }
+        const sim = await connection.simulateTransaction(txObj);
+        if (sim.value && sim.value.err) {
+          console.error('[Jupiter][sell] Swap simulation failed:', sim.value.err);
+          console.error('[Jupiter][sell] sim logs:', sim.value.logs || sim);
+          throw new Error('Swap simulation failed');
+        }
+      } catch (simErr) {
+        console.error('[Jupiter][sell] Simulation error:', simErr);
+        throw simErr;
+      }
+
+      const blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight = swapResp?.blockhashWithExpiryBlockHeight || quote?.blockhashWithExpiryBlockHeight || (await connection.getLatestBlockhashAndContext('confirmed')).value;
+
+      // refresh blockhash on tx and re-sign if necessary
+      try {
+        try {
+          const vt = VersionedTransaction.deserialize(signedBuf);
+          if (vt && vt.message && vt.message.recentBlockhash !== blockhashWithExpiryBlockHeight.blockhash) {
+            vt.message.recentBlockhash = blockhashWithExpiryBlockHeight.blockhash;
+            try { vt.sign([keypair]); } catch (sErr) { console.warn('[Jupiter][sell] Failed to re-sign VersionedTransaction:', sErr); }
+            signedBuf = vt.serialize();
+          }
+        } catch (e) {
+          try {
+            const legacy = Transaction.from(signedBuf);
+            if (legacy && legacy.recentBlockhash !== blockhashWithExpiryBlockHeight.blockhash) {
+              legacy.recentBlockhash = blockhashWithExpiryBlockHeight.blockhash;
+              legacy.signatures = legacy.signatures.map((s: any) => ({ ...s, signature: null }));
+              try { legacy.sign(keypair); } catch (sErr) { console.warn('[Jupiter][sell] Failed to re-sign legacy Transaction:', sErr); }
+              signedBuf = legacy.serialize();
+            }
+          } catch (_ignore) {}
+        }
+      } catch (refreshErr) {
+        console.warn('[Jupiter][sell] failed to refresh tx blockhash before send:', refreshErr);
+      }
+
+      const txResult = await transactionSenderAndConfirmationWaiter({ connection, serializedTransaction: signedBuf, blockhashWithExpiryBlockHeight });
       if (!txResult || !txResult.transaction) throw new Error('Transaction failed or not confirmed');
       txid = txResult.transaction.signatures?.[0] || '';
     } catch (e) {

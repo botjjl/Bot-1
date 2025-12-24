@@ -165,10 +165,61 @@ export async function monitorAndAutoSellTrades(user: any, tokens: any[], priceFi
     if (!token || !token[priceField]) continue;
     const currentPrice = token[priceField];
     let shouldSell = false;
-    // تحقق من أهداف الربح
-    if (sell.targetPrice && currentPrice >= sell.targetPrice) shouldSell = true;
-    // تحقق من وقف الخسارة
-    if (sell.stopLossPrice && currentPrice <= sell.stopLossPrice) shouldSell = true;
+    // --- Immediate mask-driven execution: do not wait for price targets
+    try {
+      const ledgerMask = Number(token.ledgerMask || 0);
+      const ledgerStrong = !!token.ledgerStrong;
+      // helper: popcount of mask
+      const popcount = (n: number) => { let c = 0; while (n) { c += n & 1; n >>>= 1; } return c; };
+      const maskBits = popcount(ledgerMask);
+
+      // Ledger weights (same mapping as engine)
+      const LEDGER_BIT_BASE_SHIFT = 6;
+      const BIT_ACCOUNT_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 0);
+      const BIT_ATA_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 1);
+      const BIT_SAME_AUTH = 1 << (LEDGER_BIT_BASE_SHIFT + 2);
+      const BIT_PROGRAM_INIT = 1 << (LEDGER_BIT_BASE_SHIFT + 3);
+      const BIT_SLOT_DENSE = 1 << (LEDGER_BIT_BASE_SHIFT + 4);
+      const BIT_LP_STRUCT = 1 << (LEDGER_BIT_BASE_SHIFT + 5);
+      const BIT_CLEAN_FUNDING = 1 << (LEDGER_BIT_BASE_SHIFT + 6);
+      const BIT_SLOT_ALIGNED = 1 << (LEDGER_BIT_BASE_SHIFT + 7);
+      const BIT_CREATOR_EXPOSED = 1 << (LEDGER_BIT_BASE_SHIFT + 8);
+      const BIT_SOLLET_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 9);
+
+      const LEDGER_WEIGHTS: Record<number, number> = {
+        [BIT_ACCOUNT_CREATED]: 0.06,
+        [BIT_ATA_CREATED]: 0.05,
+        [BIT_SAME_AUTH]: 0.04,
+        [BIT_PROGRAM_INIT]: 0.05,
+        [BIT_SLOT_DENSE]: 0.05,
+        [BIT_LP_STRUCT]: 0.07,
+        [BIT_CLEAN_FUNDING]: 0.08,
+        [BIT_SLOT_ALIGNED]: 0.06,
+        [BIT_CREATOR_EXPOSED]: 0.08,
+        [BIT_SOLLET_CREATED]: 0.06,
+      };
+
+      const ledgerScoreFromMask = (mask: number) => {
+        let s = 0; try{ for(const [bitStr, w] of Object.entries(LEDGER_WEIGHTS)){ const bit = Number(bitStr); if(mask & bit) s += Number(w) || 0; } }catch(_e){}
+        return s;
+      };
+      const ledgerScore = ledgerScoreFromMask(ledgerMask);
+
+      const earlyScoreThreshold = Number(process.env.LEDGER_EARLY_SCORE_THRESHOLD || (user.strategy && user.strategy.minLedgerScore) || 0.06);
+      const earlyMinBits = Number(process.env.LEDGER_EARLY_MIN_BITS || 2);
+
+      // Immediate execution: if the ledger/sollet progressive mask indicates intent within the same mask,
+      // execute pending sells immediately (do not wait for price targets).
+      const immediateMaskTrigger = (ledgerStrong || ledgerScore >= earlyScoreThreshold || maskBits >= earlyMinBits || !!token.solletCreatedHere);
+      if (immediateMaskTrigger) {
+        shouldSell = true;
+        sell.earlyTriggeredBy = sell.earlyTriggeredBy || [];
+        if (ledgerStrong) sell.earlyTriggeredBy.push('ledgerStrong');
+        if (ledgerScore >= earlyScoreThreshold) sell.earlyTriggeredBy.push('ledgerScore');
+        if (maskBits >= earlyMinBits) sell.earlyTriggeredBy.push('ledgerMaskBits');
+        if (token.solletCreatedHere) sell.earlyTriggeredBy.push('sollet');
+      }
+    } catch (e) {}
     if (shouldSell) {
       try {
         const result = await unifiedSell(token.address, sell.amount, user.secret /*, { slippage: user.strategy.slippage }*/);

@@ -22,9 +22,43 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
     return results;
   }
 
+  function popcount(n: number){ let c=0; while(n){ c += n & 1; n >>= 1; } return c; }
+
   for (const token of filteredTokens) {
     try {
+      // Attach mask metadata so callers can make trading/masking decisions
+      const ledgerMask = Number(token.ledgerMask || 0);
+      const maskBits = popcount(ledgerMask);
+      const mergedSignal = !!token.mergedSignal || !!token.ledgerStrong || !!token.solletCreatedHere;
+
+      // For live buys (not simulateOnly) require a merged detector signal (detector-first requirement)
+      if (!options.simulateOnly && mode === 'buy'){
+        if (!mergedSignal){
+          const msg = `[autoExecute] Skipping live buy for ${token.mint}: missing merged detector signal (mergedSignal=${mergedSignal}, ledgerMask=${ledgerMask})`;
+          console.warn(msg);
+          results.push({ token: token.mint, skipped: true, reason: 'missing_merged_signal', ledgerMask, maskBits, mergedSignal });
+          continue;
+        }
+        if (!user || (!user.id && !user.username)){
+          console.warn(`[autoExecute] Skipping live buy for ${token.mint}: missing user id/username`);
+          results.push({ token: token.mint, skipped: true, reason: 'missing_user_id', ledgerMask, maskBits, mergedSignal });
+          continue;
+        }
+        if (!user.secret){
+          console.warn(`[autoExecute] Skipping live buy for ${token.mint}: missing user secret`);
+          results.push({ token: token.mint, skipped: true, reason: 'missing_user_secret', ledgerMask, maskBits, mergedSignal });
+          continue;
+        }
+      }
+
       // Execute auto buy/sell (transaction sending is controlled globally by LIVE_TRADES and the central sender)
+      // If we are only in simulation mode but the user has no secret, skip: Jupiter simulation requires a valid keypair.
+      if (options.simulateOnly && !user.secret){
+        console.warn(`[autoExecute] Skipping simulation for ${token.mint}: missing user secret required for simulation`);
+        results.push({ token: token.mint, skipped: true, reason: 'missing_user_secret_for_simulation', ledgerMask, maskBits, mergedSignal });
+        continue;
+      }
+
       let result;
       if (mode === 'buy') {
         result = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, user.secret);
@@ -33,7 +67,7 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
       }
       console.log(`[autoExecute] ${mode} for user ${user.id || user.username} on token ${token.mint}:`, result);
       const wasSimulated = !!options.simulateOnly || process.env.LIVE_TRADES !== 'true';
-      results.push({ token: token.mint, result, simulated: wasSimulated });
+      results.push({ token: token.mint, result, simulated: wasSimulated, ledgerMask, maskBits, mergedSignal });
 
       // If caller wanted simulateOnly, but simulation was successful, optionally perform live buy immediately
       // This protects users from ATA or other one-time fees by following simulation with a real send.
