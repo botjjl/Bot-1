@@ -46,14 +46,34 @@ async function run(fileArg){
     sniper.notifier.emit('programEvent', ev);
 
     // wait for async probes to run
-    await new Promise(r=>setTimeout(r, 3000));
+    // wait for async probes to run (increase slightly to allow final reprobes)
+    await new Promise(r=>setTimeout(r, 2500));
     const mintAddr = ev.freshMints[0];
     const stateObj = p.states.get(mintAddr) || null;
     console.error('FSM state entry for mint:', JSON.stringify(stateObj, null, 2));
 
-    // Check ledgerMask
-    const ledgerMask = stateObj && stateObj.ledgerMask ? stateObj.ledgerMask : 0;
-    console.error('ledgerMask:', ledgerMask);
+    // Check ledgerMask and decode bit names and timing metrics
+    const ledgerMask = stateObj && stateObj.ledgerMask ? Number(stateObj.ledgerMask) : 0;
+    const ledgerTs = stateObj && stateObj._ledgerTs ? stateObj._ledgerTs : null;
+    const finalLatency = stateObj && stateObj._lastFinalReprobeLatency ? stateObj._lastFinalReprobeLatency : null;
+    console.error('ledgerMask:', ledgerMask, 'ledgerTs:', ledgerTs, 'finalReprobeLatencyMs:', finalLatency);
+    // decode bits to names (same mapping as FSM)
+    const LEDGER_BIT_NAMES = {
+      64: 'AccountCreated', // 1<<6
+      128: 'ATACreated',
+      256: 'SameAuthority',
+      512: 'ProgramInit',
+      1024: 'SlotDensity',
+      2048: 'LPStruct',
+      4096: 'CleanFunding',
+      8192: 'SlotAligned',
+      16384: 'CreatorExposed'
+    };
+    const names = [];
+    for (const [bitVal, name] of Object.entries(LEDGER_BIT_NAMES)){
+      try{ if(ledgerMask & Number(bitVal)) names.push(name); }catch(_e){}
+    }
+    console.error('Decoded ledgerMask names:', names.join(', ') || '(none)');
 
     // Now simulate forced buy (use run_live_sim_buy_force logic)
     const state = { token: tok.tokenAddress||tok.mint||tok.address, liquidity_usd: 15000, pool_initialized: true, is_transferable: true, mint_authority: false, freeze_authority: false, update_authority: false };
@@ -73,6 +93,18 @@ async function run(fileArg){
     await sim.slot_trigger(clock2, clock2.current_slot()+2, execSell);
 
     console.error('Buy+Sell simulation complete.');
+
+    // Simulate a fake user's immediate buy/sell log (no real RPC)
+    try{
+      const fakeUser = { id: 'test-user', username: 'testuser', strategy: { buyAmount: 0.05, sellAmount: 0.05 }, secret: 'FAKE-SECRET' };
+      console.error('[SIM_FAKE_USER] Simulating immediate buy for user', fakeUser.id, 'token', state.token || mintAddr, 'amount', fakeUser.strategy.buyAmount);
+      const simBuyResult = { tx: 'SIM_TX_BUY_FAKE', status: 'simulated', latencyMs: 5, ledgerMask, ledgerMaskNames: names, finalReprobeMs: finalLatency };
+      console.error('[SIM_FAKE_USER] buy result:', JSON.stringify(simBuyResult));
+      // Simulate immediate sell 50% afterwards
+      console.error('[SIM_FAKE_USER] Simulating immediate sell (50%) for user', fakeUser.id);
+      const simSellResult = { tx: 'SIM_TX_SELL_FAKE', status: 'simulated', latencyMs: 3, ledgerMask, ledgerMaskNames: names, finalReprobeMs: finalLatency };
+      console.error('[SIM_FAKE_USER] sell result:', JSON.stringify(simSellResult));
+    }catch(e){ console.error('Fake user simulation error', e); }
     process.exit(0);
   }catch(e){ console.error('run_buy_sell_flow error', e && e.stack || e); process.exit(1); }
 }

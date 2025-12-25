@@ -362,7 +362,17 @@ export function fmt(val: number | string | undefined | null, digits?: number, un
 // --- Helper functions for building the message ---
 
 function buildInlineKeyboard(token: any, botUsername: string, pairAddress: string, userId?: string) {
-  const dexUrl = token.url || (pairAddress ? `https://dexscreener.com/solana/${pairAddress}` : '');
+  // Use provided token.url, otherwise fallback to DexScreener pair page
+  let dexUrl = token.url || (pairAddress ? `https://dexscreener.com/solana/${pairAddress}` : '');
+  try{
+    // Append mask/mergedSignal info to the existing DexScreener URL so the existing button carries detector context
+    const mask = typeof token.ledgerMask !== 'undefined' ? Number(token.ledgerMask) : 0;
+    const merged = !!token.mergedSignal || !!token.ledgerStrong || !!token.solletCreatedHere;
+    if(dexUrl && mask) {
+      const sep = dexUrl.includes('?') ? '&' : '?';
+      dexUrl = dexUrl + `${sep}mask=${mask}&merged=${merged ? 1 : 0}`;
+    }
+  }catch(_e){}
   const twitterEmoji = '🐦', dexEmoji = '🧪', shareEmoji = '📤';
   const inlineKeyboard: any[][] = [];
   // Row 1: Twitter, DexScreener (only if available)
@@ -534,6 +544,24 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
     const network = token.chainId || token.chain || token.chainName;
     msg += `🌐 <b>Network:</b> ${network}\n`;
   }
+  // --- Ledger / Sollet progressive mask display ---
+  try {
+    const maskNum = Number(token.ledgerMask || 0);
+    const MASK_NAME_MAP: Record<number, string> = { 6: 'AccountCreated', 7: 'ATACreated', 8: 'SameAuthority', 9: 'ProgramInit', 10: 'SlotDensity', 11: 'LPStruct', 12: 'CleanFunding', 13: 'SlotAligned', 14: 'CreatorExposed' };
+    const names: string[] = [];
+    for (let b = 6; b <= 14; b++) {
+      if (maskNum & (1 << b)) {
+        names.push(MASK_NAME_MAP[b] || `bit${b}`);
+      }
+    }
+    const totalBits = 9;
+    const count = names.length;
+    const pct = Math.round((count / totalBits) * 100);
+    msg += `\n🛡️ <b>Detector Signal:</b> ${token.mergedSignal ? '✅' : '❌'} (${count}/${totalBits}) ${progressBar(pct, totalBits, '🟪', '⬜')}\n`;
+    if (names.length) msg += `<i>Signals:</i> ${names.join(', ')}\n`;
+    if (token.solletCreatedHere) msg += `⚠️ <b>Sollet-like init detected</b>\n`;
+    if (token.ledgerStrong) msg += `🔎 <b>Ledger strong signal</b>\n`;
+  } catch (e) { /* no-op */ }
   // --- Only add community/footer line ---
   msg += `\n${memecoinEmoji} <b>Solana Memecoin Community</b> | ${solEmoji} <b>Powered by DexScreener</b>\n`;
   // --- Inline keyboard (all links/buttons at the bottom) ---

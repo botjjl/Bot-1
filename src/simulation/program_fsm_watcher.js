@@ -39,7 +39,7 @@ const BIT_SLOT_SEQ = 1<<5;
 const CORE_MASK = BIT_MINT_EXISTS|BIT_AUTH_OK|BIT_POOL_EXISTS|BIT_POOL_INIT;
 const READY_MASK = CORE_MASK; // legacy name
 
-// scoring weights (sum to 1.0)
+// scoring weights (sum to ~1.0)
 const WEIGHTS = {
   [BIT_MINT_EXISTS]: 0.20,
   [BIT_AUTH_OK]: 0.20,
@@ -60,6 +60,10 @@ const LEDGER_WEIGHTS = {
   [BIT_SLOT_ALIGNED]: 0.06,
   [BIT_CREATOR_EXPOSED]: 0.08,
 };
+
+// Merge tuning: weights for sollet-derived signal and ledger scaling. These can be tuned via ENV
+const SOLLET_WEIGHT = Number(process.env.SOLLET_WEIGHT || 0.12);
+const LEDGER_CONFIDENCE_SCALE = Number(process.env.LEDGER_CONFIDENCE_SCALE || 0.85);
 
 // helper: decode ledger mask into names
 const LEDGER_BIT_NAMES = {
@@ -389,19 +393,27 @@ class ProgramFSM extends EventEmitter {
               // require transferable as a hard guard
               const hasTransferable = Boolean(s.mask & BIT_TRANSFERABLE);
               const coreOk = ((s.mask & CORE_MASK) === CORE_MASK);
-              // compute score
-              let score = 0;
+              // compute score (base FSM bits) and separate ledger/sollet contributions
+              let baseScore = 0;
               for(const [bit, w] of Object.entries(WEIGHTS)){
-                try{ if(s.mask & Number(bit)) score += Number(w); }catch(_e){}
+                try{ if(s.mask & Number(bit)) baseScore += Number(w); }catch(_e){}
               }
-              // include ledger-derived mask contributions (if present)
+              // ledger-derived mask contributions (kept separate and scaled)
               let ledgerMask = 0;
               try{ ledgerMask = s.ledgerMask || 0; }catch(_e){ ledgerMask = 0; }
+              let ledgerScore = 0;
               try{
                 for(const [bit, w] of Object.entries(LEDGER_WEIGHTS)){
-                  try{ if(ledgerMask & Number(bit)) score += Number(w); }catch(_e){}
+                  try{ if(ledgerMask & Number(bit)) ledgerScore += Number(w); }catch(_e){}
                 }
               }catch(_e){}
+              ledgerScore = ledgerScore * LEDGER_CONFIDENCE_SCALE;
+              // sollet quick-detect bonus (from event or attached flags)
+              const solletFlag = Boolean(ev && (ev.solletCreated || ev.solletCreatedHere || ev.sollet));
+              const solletScore = solletFlag ? SOLLET_WEIGHT : 0;
+              // merged score normalized (cap at 1.0)
+              let mergedScore = baseScore + ledgerScore + solletScore;
+              if(mergedScore > 1) mergedScore = 1;
               // ledger strong shortcut: if ledger signals are strong and transferable detected, prefer fire
               let ledgerStrong = false;
               try{ ledgerStrong = Boolean(this.ledger && this.ledger.isStrongSignal && this.ledger.isStrongSignal(m, s.slot || slot, 2)); }catch(_e){ ledgerStrong = false; }
@@ -409,8 +421,8 @@ class ProgramFSM extends EventEmitter {
                 try{ console.error('[FSM] ledgerStrong detected for', m, 'ledgerMaskNames=', decodeLedgerMask(ledgerMask)); }catch(_e){}
               }
 
-              // ready if transferable present AND (core bits all present OR score >= threshold)
-                      const triggeredNow = (hasTransferable && (coreOk || score >= SCORE_THRESHOLD)) || (ledgerStrong && hasTransferable);
+              // ready if transferable present AND (core bits all present OR mergedScore >= threshold)
+                      const triggeredNow = (hasTransferable && (coreOk || mergedScore >= SCORE_THRESHOLD)) || (ledgerStrong && hasTransferable);
                       if(triggeredNow){
                         const trig = { mint: m, slot: s.slot, mask: s.mask, reason: 'ready_mask_matched_in_slot', probes: { simulated: true } };
                         // attach ledgerMask names for downstream consumers
@@ -440,11 +452,11 @@ class ProgramFSM extends EventEmitter {
                   try{ const clock = new sim.SlotClock(Number(slot)); sim.slot_trigger(clock, Number(slot), execution).then(res=>{ console.error('[FSM] slot_trigger finished', res); }).catch(()=>{}); }catch(e){ console.error('[FSM] slot_trigger start error', e); }
                 }catch(e){ console.error('[FSM] trigger handling error', e); }
                       // append metric indicating triggered
-                      try{ metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: finalReprobeLatency, triggered: true, ledgerMask: ledgerMask || 0, ledgerMaskNames: (ledgerMask ? decodeLedgerMask(ledgerMask) : []), mask: s.mask, slot: s.slot, score: score }); }catch(_e){}
+                            try{ metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: finalReprobeLatency, triggered: true, ledgerMask: ledgerMask || 0, ledgerMaskNames: (ledgerMask ? decodeLedgerMask(ledgerMask) : []), mask: s.mask, slot: s.slot, score: mergedScore, baseScore, ledgerScore, solletScore }); }catch(_e){}
               } else {
                 // not ready after final probe
                 this.emit('state', { mint: m, mask: s.mask, slot: s.slot, lastSeen: s.lastSeenTs, note: 'not_ready_after_final_reprobe' });
-                      try{ metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: finalReprobeLatency, triggered: false, ledgerMask: ledgerMask || 0, ledgerMaskNames: (ledgerMask ? decodeLedgerMask(ledgerMask) : []), mask: s.mask, slot: s.slot, score: score }); }catch(_e){}
+                            try{ metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: finalReprobeLatency, triggered: false, ledgerMask: ledgerMask || 0, ledgerMaskNames: (ledgerMask ? decodeLedgerMask(ledgerMask) : []), mask: s.mask, slot: s.slot, score: mergedScore, baseScore, ledgerScore, solletScore }); }catch(_e){}
               }
             }catch(e){ console.error('[FSM] trigger outer error', e); }
           }

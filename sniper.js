@@ -140,6 +140,35 @@ function computeFirstSigTTL(){
 const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 12; // allowed delta between firstSig.blockTime and tx.blockTime
 const FIRST_SIG_CACHE = new Map(); // mint -> { sig, blockTime, ts }
 
+// small cache to remember which addresses are actual SPL mints vs token accounts
+const MINT_ADDRESS_CACHE = new Map(); // addr -> { isMint: bool, ts }
+const MINT_ADDRESS_TTL = Number(process.env.MINT_ADDRESS_TTL_MS || 30000);
+
+async function isOnChainMintAddress(addr){
+  try{
+    if(!addr) return false;
+    const now = Date.now();
+    const cached = MINT_ADDRESS_CACHE.get(addr);
+    if(cached && (now - cached.ts) < MINT_ADDRESS_TTL) return !!cached.isMint;
+    // probe via helius getAccountInfo (base64) to inspect data length (SPL Mint layout ~82 bytes)
+    const res = await heliusRpc('getAccountInfo', [addr, { encoding: 'base64' }]);
+    // Helius returns { value: { data: [base64, 'base64'], ... } }
+    let isMint = false;
+    try{
+      if(res && res.value){
+        const data = res.value.data;
+        if(Array.isArray(data) && typeof data[0] === 'string'){
+          const buf = Buffer.from(data[0], 'base64');
+          // SPL Mint account layout size is 82 bytes
+          if(buf && buf.length === 82) isMint = true;
+        }
+      }
+    }catch(e){}
+    MINT_ADDRESS_CACHE.set(addr, { isMint: !!isMint, ts: Date.now() });
+    return !!isMint;
+  }catch(e){ return false; }
+}
+
 async function getFirstSignatureCached(mint){
   if(!mint) return null;
   try{
@@ -856,6 +885,14 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
             }catch(e){}
             if(accept){
               try{
+                // validate that the candidate address is an on-chain SPL Mint
+                try{
+                  const isMintOnChain = await isOnChainMintAddress(m);
+                  if(!isMintOnChain){
+                    try{ console.error('collectFreshMints: skipping non-mint-on-chain address', m); }catch(e){}
+                    continue;
+                  }
+                }catch(e){}
                 // compute lightweight on-chain age fields for downstream consumers
                 const firstCached = await getFirstSignatureCached(m).catch(()=>null);
                 const ft = firstCached && firstCached.blockTime ? firstCached.blockTime : null;

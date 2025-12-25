@@ -42,6 +42,9 @@ const Jupiter = {
     const FEE_SPLIT_ENABLED = String(process.env.ENABLE_FEE_SPLIT || 'false').toLowerCase() === 'true';
     const FEE_SPLIT_PERCENT = Number(process.env.FEE_SPLIT_PERCENT || '25');
     const MIN_SOL_RESERVE = Number(process.env.MIN_SOL_RESERVE || '0.001');
+    const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS || '15'); // default 0.30%
+    const JUPITER_MAX_HOPS = Number(process.env.JUPITER_MAX_HOPS || '2'); // prefer <=2 hops routes
+    const PRIOR_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS || '50000');
 
     // initial balance check (pre-swap) including estimated rent-exemption buffer
     try {
@@ -66,8 +69,14 @@ const Jupiter = {
     const jupiter = createJupiterApiClient();
     let quote: any;
     try {
-      const PRIOR_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS) || 200000;
-      quote = await jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: Math.floor(amount * 1e9), slippageBps: 100, prioritizationFeeLamports: PRIOR_FEE });
+      quote = await jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: Math.floor(amount * 1e9), slippageBps: JUPITER_SLIPPAGE_BPS, prioritizationFeeLamports: PRIOR_FEE });
+      // prefer short-hop routes when available
+      try{
+        if(quote && quote.routePlan && Array.isArray(quote.routePlan.routes)){
+          const filtered = quote.routePlan.routes.filter((r:any)=>!(r.marketInfos && r.marketInfos.length>JUPITER_MAX_HOPS));
+          if(filtered.length>0) quote.routePlan.routes = filtered;
+        }
+      }catch(_){ }
     } catch (e) {
       console.error('[Jupiter][buy] Failed to get quote:', e);
       throw e;
@@ -269,7 +278,24 @@ const Jupiter = {
     const jupiter = createJupiterApiClient();
     let quote: any;
     try {
-      quote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: Math.floor(amount * 1e9), slippageBps: 100 });
+        // Jupiter expects `amount` in base units of the input mint.
+        // If caller provided a large integer (likely already base units), pass it through.
+        let amountForQuote: number;
+        if (Number.isInteger(amount) && amount > 1e6) {
+          amountForQuote = Math.floor(amount);
+        } else {
+          // default: treat `amount` as SOL-equivalent (like buys) and convert to lamports
+          amountForQuote = Math.floor(amount * 1e9);
+        }
+        const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS || '30');
+        const JUPITER_MAX_HOPS = Number(process.env.JUPITER_MAX_HOPS || '2');
+        quote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: amountForQuote, slippageBps: JUPITER_SLIPPAGE_BPS });
+        try{
+          if(quote && quote.routePlan && Array.isArray(quote.routePlan.routes)){
+            const filtered = quote.routePlan.routes.filter((r:any)=>!(r.marketInfos && r.marketInfos.length>JUPITER_MAX_HOPS));
+            if(filtered.length>0) quote.routePlan.routes = filtered;
+          }
+        }catch(_){ }
     } catch (e) {
       console.error('[Jupiter][sell] Failed to get quote:', e);
       throw e;
@@ -363,9 +389,50 @@ const Jupiter = {
   }
 };
 
-// Reduce parallel trades to 1 (sequential only)
-const BUY_SOURCES = [Jupiter];
-const SELL_SOURCES = [Jupiter];
+// Raydium implementation wrapper (prefer for performance / single-hop routes)
+const Raydium = {
+  name: 'raydium',
+  async buy(tokenMint: string, amount: number, payerKeypair: any, ctrl?: any) {
+    if (ctrl?.cancelled) throw new Error('Cancelled');
+    const { RaydiumSwapService } = require('./raydium/raydium.service');
+    const bs58 = require('bs58');
+    let pk: string;
+    try {
+      if (typeof payerKeypair === 'string') pk = bs58.encode(Buffer.from(payerKeypair, 'base64').slice(0,32));
+      else if (payerKeypair && payerKeypair.secretKey) pk = bs58.encode(Buffer.from(payerKeypair.secretKey));
+      else if (Array.isArray(payerKeypair)) pk = bs58.encode(Buffer.from(payerKeypair));
+      else pk = payerKeypair as any;
+    } catch (e) { pk = payerKeypair as any; }
+    const svc = new RaydiumSwapService();
+    const slippageBps = Number(process.env.RAYDIUM_SLIPPAGE_BPS || process.env.JUPITER_SLIPPAGE_BPS || '30');
+    const gasFee = Number(process.env.RAYDIUM_GAS_FEE_SOL || '0.00001');
+    const res = await svc.swapToken(pk, 'So11111111111111111111111111111111111111112', tokenMint, 9, amount, slippageBps, gasFee, false, process.env.RAYDIUM_USERNAME || 'bot', false);
+    if (!res) throw new Error('Raydium swap returned null');
+    return { tx: res.bundleId || res.signature || res.tx || null, price: null, signature: res.signature || res.bundleId };
+  },
+  async sell(tokenMint: string, amount: number, payerKeypair: any, ctrl?: any) {
+    if (ctrl?.cancelled) throw new Error('Cancelled');
+    const { RaydiumSwapService } = require('./raydium/raydium.service');
+    const bs58 = require('bs58');
+    let pk: string;
+    try {
+      if (typeof payerKeypair === 'string') pk = bs58.encode(Buffer.from(payerKeypair, 'base64').slice(0,32));
+      else if (payerKeypair && payerKeypair.secretKey) pk = bs58.encode(Buffer.from(payerKeypair.secretKey));
+      else if (Array.isArray(payerKeypair)) pk = bs58.encode(Buffer.from(payerKeypair));
+      else pk = payerKeypair as any;
+    } catch (e) { pk = payerKeypair as any; }
+    const svc = new RaydiumSwapService();
+    const slippageBps = Number(process.env.RAYDIUM_SLIPPAGE_BPS || process.env.JUPITER_SLIPPAGE_BPS || '30');
+    const gasFee = Number(process.env.RAYDIUM_GAS_FEE_SOL || '0.00001');
+    const res = await svc.swapToken(pk, tokenMint, 'So11111111111111111111111111111111111111112', 9, amount, slippageBps, gasFee, false, process.env.RAYDIUM_USERNAME || 'bot', false);
+    if (!res) throw new Error('Raydium sell returned null');
+    return { tx: res.bundleId || res.signature || res.tx || null, signature: res.signature || res.bundleId };
+  }
+};
+
+// Prefer Raydium first for lower-latency single-hop swaps, fallback to Jupiter
+const BUY_SOURCES = [Raydium, Jupiter];
+const SELL_SOURCES = [Raydium, Jupiter];
 
 // getJupiterPrice, getRaydiumPrice, getDexPrice helpers (keep previous behavior but simplified)
 async function getJupiterPrice(tokenMint: string, amount: number) {
@@ -446,13 +513,24 @@ async function raceSources(sources: any[], fnName: 'buy'|'sell', tokenMint: stri
 
 // unifiedBuy
 export async function unifiedBuy(tokenMint: string, amount: number, payerKeypair: any) {
-  const [jupiter, raydium, dex] = await Promise.all([getJupiterPrice(tokenMint, amount), getRaydiumPrice(tokenMint, amount), getDexPrice(tokenMint, amount)]);
-  const results = [jupiter, raydium, dex].filter(Boolean);
-  const best = results.reduce((prev: any, curr: any) => curr.priceUsd < prev.priceUsd ? curr : prev);
-  const buyResult = await best.buy(tokenMint, amount, payerKeypair);
-  const br: any = buyResult;
-  const tx = br && (br.tx || br.txSignature || br.signature) || null;
-  return { tx, source: best.source, success: !!tx, raw: buyResult, priceUsd: best.priceUsd, priceSol: best.priceSol };
+  // Try sources in preferred order (Raydium then Jupiter) using sequential race.
+  try {
+    const res = await raceSources(BUY_SOURCES, 'buy', tokenMint, amount, payerKeypair);
+    const r: any = res;
+    return { tx: r.tx || r.txSignature || r.signature || null, source: r.source || r.name || 'unknown', success: !!(r.tx || r.txSignature || r.signature), raw: r };
+  } catch (e) {
+    // If the sequential sources fail, fall back to price-based selection (best effort)
+    try {
+      const [jupiterInfo, raydiumInfo, dexInfo] = await Promise.all([getJupiterPrice(tokenMint, amount).catch(()=>null), getRaydiumPrice(tokenMint, amount).catch(()=>null), getDexPrice(tokenMint, amount).catch(()=>null)]);
+      const infos = [raydiumInfo, jupiterInfo, dexInfo].filter(Boolean);
+      const best = infos.reduce((p:any,c:any)=> (p.priceUsd && c.priceUsd && c.priceUsd < p.priceUsd) ? c : p, infos[0]);
+      if(!best) throw e;
+      const br = await best.buy(tokenMint, amount, payerKeypair);
+      return { tx: br && (br.tx || br.signature || br.bundleId) || null, source: best.source || 'unknown', success: !!br };
+    } catch (_inner) {
+      throw e;
+    }
+  }
 }
 
 // unifiedSell
@@ -466,4 +544,212 @@ export async function unifiedSell(tokenMint: string, amount: number, secret: str
     success: !!tx,
     raw: r
   };
+}
+
+// Batch buy+sell via Jupiter unsigned transactions, then request wallet to sign all transactions at once.
+// This reduces Ledger/Sollet prompts by calling `signAllTransactions` once when supported.
+export async function unifiedBuyAndSellBatch(walletAdapter: any, tokenMint: string, buyAmountSol: number, slippageBps?: number, options?: { simulateOnly?: boolean, atomic?: boolean, createAtaBeforeSell?: boolean, reverseOrder?: boolean, debugDumpSellSwapResp?: boolean }) {
+  if (!walletAdapter || !walletAdapter.publicKey) throw new Error('walletAdapter with publicKey required');
+  const SOL_MINT = 'So11111111111111111111111111111111111111112';
+  const connection = rpcPool.getRpcConnection();
+  const jupiter = createJupiterApiClient();
+  const JUPITER_SLIPPAGE_BPS = Number((slippageBps ?? process.env.JUPITER_SLIPPAGE_BPS) || '30');
+
+  // 1) Get buy quote (SOL -> token)
+  const buyAmountLamports = Math.floor(buyAmountSol * 1e9);
+  const buyQuote = await jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: buyAmountLamports, slippageBps: JUPITER_SLIPPAGE_BPS }).catch((e:any)=>{ throw new Error('Failed to get buy quote: '+String(e)); });
+  if (!buyQuote || !buyQuote.routePlan) throw new Error('No buy route found');
+
+  // Attempt to extract expected output amount from quote
+  const expectedOutAmount = buyQuote.outAmount || buyQuote.outAmountLamports || buyQuote.outAmountString || buyQuote.routePlan.outAmount || null;
+  if (!expectedOutAmount) {
+    // try routePlan routes to compute out amount
+    try {
+      const route = buyQuote.routePlan.routes && buyQuote.routePlan.routes[0];
+      if (route && route.outAmount) {
+        // some versions expose outAmount on route
+        // leave as-is
+      }
+    } catch (_) {}
+  }
+  const outAmountForSell = Number(expectedOutAmount || 0);
+  if (!outAmountForSell || outAmountForSell <= 0) throw new Error('Cannot determine expected token output amount for sell preparation');
+
+  // 2) Build unsigned buy swap transaction
+  const userPublicKey = walletAdapter.publicKey.toBase58();
+  const buySwapReq = { userPublicKey, wrapAndUnwrapSol: true, asLegacyTransaction: false, quoteResponse: buyQuote };
+  const buySwapResp = await jupiter.swapPost({ swapRequest: buySwapReq }).catch((e:any)=>{ throw new Error('Failed to build buy swap transaction: '+String(e)); });
+  if (!buySwapResp || !buySwapResp.swapTransaction) throw new Error('Failed to obtain buy swap transaction');
+  const buyBuf = Buffer.from(buySwapResp.swapTransaction, 'base64');
+
+  // Optional: simulate the buy swap to extract actual output token amount (base units) and ATA address
+  let extractedOutAmount = Number(expectedOutAmount || 0);
+  let extractedAta: string | null = null;
+  try {
+    const buyTxObj = (() => { try { return VersionedTransaction.deserialize(buyBuf); } catch (_) { return Transaction.from(buyBuf); } })();
+    const simBuy = await connection.simulateTransaction(buyTxObj).catch(()=>null);
+    if (simBuy && simBuy.value && simBuy.value.postTokenBalances) {
+      const post = simBuy.value.postTokenBalances;
+      for (const p of post) {
+        if (p && p.mint === tokenMint && p.owner === userPublicKey) {
+          extractedOutAmount = Number(p.amount || p.uiTokenAmount?.amount || 0);
+          extractedAta = p.accountIndex != null ? null : null;
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    // ignore simulation extraction errors
+  }
+
+  // 3) Build unsigned sell swap transaction (token -> SOL) using expected out amount
+  // Prefer extractedOutAmount (from simulated buy) if available
+  const sellAmountForQuote = extractedOutAmount && extractedOutAmount > 0 ? Math.floor(extractedOutAmount) : Math.floor(outAmountForSell);
+  const sellQuote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: sellAmountForQuote, slippageBps: JUPITER_SLIPPAGE_BPS }).catch((e:any)=>{ throw new Error('Failed to get sell quote: '+String(e)); });
+  if (!sellQuote || !sellQuote.routePlan) throw new Error('No sell route found');
+  const sellSwapReq = { userPublicKey, wrapAndUnwrapSol: true, asLegacyTransaction: false, quoteResponse: sellQuote };
+  const sellSwapResp = await jupiter.swapPost({ swapRequest: sellSwapReq }).catch((e:any)=>{ throw new Error('Failed to build sell swap transaction: '+String(e)); });
+  if (!sellSwapResp || !sellSwapResp.swapTransaction) throw new Error('Failed to obtain sell swap transaction');
+  const sellBuf = Buffer.from(sellSwapResp.swapTransaction, 'base64');
+
+  // Debug helper: if requested, return the raw sellSwapResp for inspection (accountKeys, instruction metas)
+  if (options && options.debugDumpSellSwapResp) {
+    try {
+      // avoid leaking huge buffers; stringify safe fields
+      const safe: any = {
+        swapResponseKeys: sellSwapResp?.accountKeys || sellSwapResp?.accounts || null,
+        swapResponseMeta: { blockhashWithExpiryBlockHeight: sellSwapResp?.blockhashWithExpiryBlockHeight || null, swapTransaction: '<<base64 omitted>>' },
+        raw: (()=>{ try{ const copy = { ...sellSwapResp }; if(copy.swapTransaction) copy.swapTransaction = '<<base64 omitted>>'; return copy; }catch(_){ return null; } })()
+      };
+      console.log('[unifiedBuyAndSellBatch][debugDumpSellSwapResp] dumping sellSwapResp');
+      return safe;
+    } catch (e) {
+      return { error: String(e), raw: (sellSwapResp && typeof sellSwapResp === 'object') ? JSON.stringify(Object.keys(sellSwapResp)) : String(sellSwapResp) };
+    }
+  }
+
+  // 4) Deserialize txs into objects wallet can sign or simulate
+  const txs: any[] = [];
+  try {
+    // push transactions in requested order
+    if (options && options.reverseOrder) {
+      try { txs.push(VersionedTransaction.deserialize(sellBuf)); } catch (_) { txs.push(Transaction.from(sellBuf)); }
+      // optionally insert ATA before sell
+      if (options && options.createAtaBeforeSell) {
+        try {
+          const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
+          const ownerPub = new PublicKey(walletAdapter.publicKey.toBase58());
+          const mintPub = new PublicKey(tokenMint);
+          const ataAddr = await getAssociatedTokenAddress(mintPub, ownerPub);
+          const ataTx = new Transaction();
+          ataTx.add(createAssociatedTokenAccountInstruction(ownerPub, ataAddr, ownerPub, mintPub));
+          try { ataTx.recentBlockhash = (await connection.getLatestBlockhashAndContext('confirmed')).value.blockhash; } catch (_) {}
+          ataTx.feePayer = ownerPub;
+          txs.push(ataTx);
+        } catch (_aErr) {}
+      }
+      try { txs.push(VersionedTransaction.deserialize(buyBuf)); } catch (_) { txs.push(Transaction.from(buyBuf)); }
+    } else {
+      try { txs.push(VersionedTransaction.deserialize(buyBuf)); } catch (_) { txs.push(Transaction.from(buyBuf)); }
+      if (options && options.createAtaBeforeSell) {
+        try {
+          const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
+          const ownerPub = new PublicKey(walletAdapter.publicKey.toBase58());
+          const mintPub = new PublicKey(tokenMint);
+          const ataAddr = await getAssociatedTokenAddress(mintPub, ownerPub);
+          const ataTx = new Transaction();
+          ataTx.add(createAssociatedTokenAccountInstruction(ownerPub, ataAddr, ownerPub, mintPub));
+          try { ataTx.recentBlockhash = (await connection.getLatestBlockhashAndContext('confirmed')).value.blockhash; } catch (_) {}
+          ataTx.feePayer = ownerPub;
+          txs.push(ataTx);
+        } catch (_aErr) {}
+      }
+      try { txs.push(VersionedTransaction.deserialize(sellBuf)); } catch (_) { txs.push(Transaction.from(sellBuf)); }
+    }
+    // If option to create ATA before sell is set, append an ATA creation transaction before the sell
+    if (options && options.createAtaBeforeSell) {
+      try {
+        const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
+        const ownerPub = new PublicKey(walletAdapter.publicKey.toBase58());
+        const mintPub = new PublicKey(tokenMint);
+        const ataAddr = await getAssociatedTokenAddress(mintPub, ownerPub);
+        const ataTx = new Transaction();
+        // createAssociatedTokenAccountInstruction(payer, associatedToken, owner, mint)
+        ataTx.add(createAssociatedTokenAccountInstruction(ownerPub, ataAddr, ownerPub, mintPub));
+        try { ataTx.recentBlockhash = (await connection.getLatestBlockhashAndContext('confirmed')).value.blockhash; } catch (_) {}
+        ataTx.feePayer = ownerPub;
+        txs.push(ataTx);
+      } catch (_aErr) {
+        // ignore ATA construction failure and continue to push sell tx normally
+      }
+    }
+    try { txs.push(VersionedTransaction.deserialize(sellBuf)); } catch (_) { txs.push(Transaction.from(sellBuf)); }
+  } catch (e) { throw new Error('Failed to deserialize swap transactions: '+String(e)); }
+  // If simulateOnly option is set, simulate txs instead of signing/sending
+  if (options && options.simulateOnly) {
+    // If atomic requested, attempt to merge into a single legacy Transaction when possible
+    if (options.atomic) {
+      try {
+        const [tBuy, tSell] = txs;
+        if (tBuy instanceof Transaction && tSell instanceof Transaction) {
+          const merged = new Transaction();
+          merged.add(...(tBuy.instructions || []));
+          merged.add(...(tSell.instructions || []));
+          merged.feePayer = walletAdapter.publicKey;
+          try { merged.recentBlockhash = (await connection.getLatestBlockhashAndContext('confirmed')).value.blockhash; } catch(_){}
+          const sim = await connection.simulateTransaction(merged).catch((e:any)=>({ error: String(e) }));
+          return [{ atomic: true, simulated: sim }];
+        }
+      } catch (_atomicErr) {
+        // fallthrough to simulate separately
+      }
+    }
+
+    // Simulate buy and sell separately
+    const sims: any[] = [];
+    for (const t of txs) {
+      try {
+        const simRes = await connection.simulateTransaction(t).catch((e:any)=>({ error: String(e) }));
+        sims.push(simRes);
+      } catch (e) { sims.push({ error: String(e) }); }
+    }
+    return sims;
+  }
+
+  // 5) Ask wallet to sign all txs in one call if supported
+  let signedTxs: any[] = [];
+  if (typeof walletAdapter.signAllTransactions === 'function') {
+    try {
+      signedTxs = await walletAdapter.signAllTransactions(txs);
+    } catch (e) {
+      // fall back to per-tx sign
+      signedTxs = [];
+      for (const t of txs) {
+        if (typeof walletAdapter.signTransaction === 'function') {
+          signedTxs.push(await walletAdapter.signTransaction(t));
+        } else {
+          throw new Error('Wallet adapter does not support signing');
+        }
+      }
+    }
+  } else if (typeof walletAdapter.signTransaction === 'function') {
+    for (const t of txs) signedTxs.push(await walletAdapter.signTransaction(t));
+  } else {
+    throw new Error('Wallet adapter has no signAllTransactions/signTransaction methods');
+  }
+
+  // 6) Serialize signed txs and send sequentially (we avoid atomicity here but reduce prompts)
+  const results: any[] = [];
+  for (const st of signedTxs) {
+    let serialized: Buffer;
+    try {
+      try { serialized = Buffer.from((st as any).serialize()); } catch (_) { serialized = Buffer.from((st as any).serialize()); }
+    } catch (e) {
+      throw new Error('Failed to serialize signed transaction: '+String(e));
+    }
+    const blockhashWithExpiryBlockHeight = (await connection.getLatestBlockhashAndContext('confirmed')).value;
+    const res = await transactionSenderAndConfirmationWaiter({ connection, serializedTransaction: serialized, blockhashWithExpiryBlockHeight }).catch((e:any)=>{ return { error: String(e) }; });
+    results.push(res);
+  }
+  return results;
 }
