@@ -63,7 +63,8 @@ function parseEnvUrls(): string[] {
   }
 
   // 3) Add any explicit single Helius URL envs
-  [env.HELIUS_RPC_URL, env.HELIUS_FAST_RPC_URL_2, env.HELIUS_RPC_URL_2, env.HELIUS_WEBSOCKET_URL, env.HELIUS_WEBSOCKET_URL_2, (fileEnv && fileEnv.HELIUS_RPC_URL), (fileEnv && fileEnv.HELIUS_FAST_RPC_URL_2), (fileEnv && fileEnv.HELIUS_RPC_URL_2)].forEach(u => {
+  // Note: do NOT include websocket-specific envs here (they are for WS only)
+  [env.HELIUS_RPC_URL, env.HELIUS_FAST_RPC_URL_2, env.HELIUS_RPC_URL_2, (fileEnv && fileEnv.HELIUS_RPC_URL), (fileEnv && fileEnv.HELIUS_FAST_RPC_URL_2), (fileEnv && fileEnv.HELIUS_RPC_URL_2)].forEach(u => {
     if (u && !list.includes(u)) list.push(u);
   });
 
@@ -260,12 +261,21 @@ export function getNextHeliusWsUrl(): string {
   // mirror behavior but prefer websocket env var if present
   const wsRaw = process.env.HELIUS_WEBSOCKET_URLS || process.env.HELIUS_WEBSOCKET_URL;
   const wsBases = wsRaw ? wsRaw.toString().split(',').map(s=>s.trim()).filter(Boolean) : [];
-  const base = wsBases.length ? wsBases[helBaseIdx % wsBases.length] : (helBases.length ? helBases[helBaseIdx % helBases.length] : 'wss://mainnet.helius-rpc.com/');
+  let base = wsBases.length ? wsBases[helBaseIdx % wsBases.length] : (helBases.length ? helBases[helBaseIdx % helBases.length] : 'wss://mainnet.helius-rpc.com/');
   const k = helKeys.length ? helKeys[helKeyIdx % helKeys.length] : null;
   // advance indices similarly
   helBaseIdx = (helBaseIdx + 1) % (helBases.length || 1);
   helKeyIdx = (helKeyIdx + 1) % (helKeys.length || 1);
-  if (k) return base + (base.includes('?') ? '&' : '?') + 'api-key=' + encodeURIComponent(k);
+  try{
+    // if base is an http(s) URL, convert scheme to ws(s)
+    if(typeof base === 'string' && base.match(/^https?:\/\//i)){
+      if(base.startsWith('https:')) base = base.replace(/^https:/i, 'wss:');
+      else if(base.startsWith('http:')) base = base.replace(/^http:/i, 'ws:');
+    }
+  }catch(e){}
+  // If base already contains an api-key, don't append another
+  const hasKey = typeof base === 'string' && /api-key=/i.test(base);
+  if (k && !hasKey) return base + (base.includes('?') ? '&' : '?') + 'api-key=' + encodeURIComponent(k);
   return base;
 }
 

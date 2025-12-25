@@ -1,117 +1,118 @@
+#!/usr/bin/env ts-node
+import rpcPool = require('../src/utils/rpcPool');
+import { PublicKey } from '@solana/web3.js';
+const aggregator = require('../src/ledgerWindowAggregator').default;
+const { LedgerSignalEngine } = require('../src/simulation/ledger_signal_engine');
+const liquidity = require('../src/simulation/liquidity').default || require('../src/simulation/liquidity');
 import fs from 'fs';
 import path from 'path';
-// use require for JS module sniper
-const sniper = require('../sniper.js');
-const { registerBuyWithTarget } = require('../src/bot/strategy');
 
-async function main(){
-  console.log('Live fetch + simulate starting...');
-  const maxCollect = 1;
-  const tokens = await sniper.collectFreshMints({ maxCollect, timeoutMs: 20000 }).catch((e:any)=>{ console.error('collectFreshMints failed', e); return []; });
-  if(!tokens || tokens.length===0){ console.error('No fresh mints found'); process.exit(1); }
-  const tok = tokens[0];
-  console.log('Collected token:', tok);
+async function sleep(ms:number){ return new Promise(r=>setTimeout(r,ms)); }
 
-  // load user
-  const usersFile = path.join(process.cwd(), 'users.json');
-  const users = JSON.parse(fs.readFileSync(usersFile,'utf8'));
-  const userId = Object.keys(users)[0];
-  const user = users[userId];
-  user.id = userId;
-  console.log('Using user:', userId);
-
-  // Optionally force a ledger mask to simulate immediate execution (set env FORCE_IMMEDIATE=1)
-  if(process.env.FORCE_IMMEDIATE === '1'){
-    // set a mask with a couple of ledger bits to exceed default thresholds
-    tok.ledgerMask = tok.ledgerMask || (1 << (6 + 0)) | (1 << (6 + 5));
-    tok.ledgerStrong = true;
-    tok.solletCreatedHere = true;
-  }
-
-  // Prepare simulated buy: pick entry price (from token if available) or default
-  const entryPrice = (tok && (tok.price || tok.priceUsd)) ? Number(tok.price || tok.priceUsd) : 1.0;
-  const buyResult = { tx: `SIM_BUY_${Date.now()}` };
-
-  // register buy and auto-sells (writes sent_tokens/<userId>.json)
-  registerBuyWithTarget(user, { address: tok.mint || tok.address || tok.tokenAddress, price: entryPrice }, buyResult, user.strategy && user.strategy.targetPercent || 10);
-  console.log('Registered simulated buy and sell orders in sent_tokens');
-
-  // Read back pending sells
-  const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
-  const userFile = path.join(sentTokensDir, `${userId}.json`);
-  if(!fs.existsSync(userFile)){ console.error('user trades file missing'); process.exit(1); }
-  const trades = JSON.parse(fs.readFileSync(userFile,'utf8')) as any[];
-  console.log('Trades after register:', trades);
-
-  // Determine early-execution: compute ledger mask/score and current price that triggers early sell
-  const ledgerMask = Number(tok.ledgerMask || 0);
-  const ledgerStrong = !!tok.ledgerStrong;
-  const maskPopcount = (n:number)=>{ let c=0; while(n){ c+=n&1; n>>=1;} return c; };
-  const maskBits = maskPopcount(ledgerMask);
-  console.log('Token ledgerMask=', ledgerMask, 'maskBits=', maskBits, 'ledgerStrong=', ledgerStrong, 'sollet=', !!tok.solletCreatedHere);
-
-  // Use same scoring as strategy.ts
-  const LEDGER_BIT_BASE_SHIFT = 6;
-  const BIT_ACCOUNT_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 0);
-  const BIT_ATA_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 1);
-  const BIT_SAME_AUTH = 1 << (LEDGER_BIT_BASE_SHIFT + 2);
-  const BIT_PROGRAM_INIT = 1 << (LEDGER_BIT_BASE_SHIFT + 3);
-  const BIT_SLOT_DENSE = 1 << (LEDGER_BIT_BASE_SHIFT + 4);
-  const BIT_LP_STRUCT = 1 << (LEDGER_BIT_BASE_SHIFT + 5);
-  const BIT_CLEAN_FUNDING = 1 << (LEDGER_BIT_BASE_SHIFT + 6);
-  const BIT_SLOT_ALIGNED = 1 << (LEDGER_BIT_BASE_SHIFT + 7);
-  const BIT_CREATOR_EXPOSED = 1 << (LEDGER_BIT_BASE_SHIFT + 8);
-  const BIT_SOLLET_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 9);
-  const LEDGER_WEIGHTS:any = {
-    [BIT_ACCOUNT_CREATED]: 0.06,
-    [BIT_ATA_CREATED]: 0.05,
-    [BIT_SAME_AUTH]: 0.04,
-    [BIT_PROGRAM_INIT]: 0.05,
-    [BIT_SLOT_DENSE]: 0.05,
-    [BIT_LP_STRUCT]: 0.07,
-    [BIT_CLEAN_FUNDING]: 0.08,
-    [BIT_SLOT_ALIGNED]: 0.06,
-    [BIT_CREATOR_EXPOSED]: 0.08,
-    [BIT_SOLLET_CREATED]: 0.06,
-  };
-  const ledgerScoreFromMask = (mask:number)=>{ let s=0; for(const k of Object.keys(LEDGER_WEIGHTS)){ const bit = Number(k); if(mask & bit) s += LEDGER_WEIGHTS[k]||0; } return s; };
-  const ledgerScore = ledgerScoreFromMask(ledgerMask);
-  console.log('ledgerScore=', ledgerScore);
-
-  const earlyThresholdFactor = Number(process.env.LEDGER_EARLY_THRESHOLD_FACTOR || '0.01');
-  const earlyScoreThreshold = Number(process.env.LEDGER_EARLY_SCORE_THRESHOLD || (user.strategy && user.strategy.minLedgerScore) || 0.06);
-  const earlyMinBits = Number(process.env.LEDGER_EARLY_MIN_BITS || 2);
-
-  // Find pending sells linked to our simulated buy
-  const pendingSells = trades.filter(t => t.mode === 'sell' && t.status === 'pending' && t.linkedBuyTx === buyResult.tx);
-  console.log('Pending sells:', pendingSells);
-  if(pendingSells.length === 0){ console.error('No pending sells found after registering buy'); process.exit(1); }
-
-  // Choose a currentPrice that will trigger early execution if possible
-  const sell = pendingSells[0];
-  const entry = sell.entryPrice || entryPrice;
-  const triggerPrice = entry * (1 + (earlyThresholdFactor + 0.001));
-  console.log('Entry price=', entry, 'triggerPrice=', triggerPrice);
-
-  const shouldEarly = (ledgerStrong || ledgerScore >= earlyScoreThreshold || maskBits >= earlyMinBits) && (triggerPrice >= entry * (1 + earlyThresholdFactor));
-  console.log('Early decision =>', shouldEarly, ' (ledgerStrong,ledgerScore,maskBits)=', ledgerStrong, ledgerScore, maskBits);
-
-  if(shouldEarly){
-    // Mark the sell order as simulated executed (no real tx)
-    const sellTx = `SIM_SELL_${Date.now()}`;
-    for(const s of trades){ if(s.linkedBuyTx === buyResult.tx && s.mode === 'sell' && s.status==='pending'){
-      s.status = 'success'; s.tx = sellTx; s.executedTime = Date.now(); s.note = 'simulated early-execution'; s.earlyTriggeredBy = s.earlyTriggeredBy || [];
-      if(ledgerStrong) s.earlyTriggeredBy.push('ledgerStrong');
-      if(ledgerScore >= earlyScoreThreshold) s.earlyTriggeredBy.push('ledgerScore');
-      if(maskBits >= earlyMinBits) s.earlyTriggeredBy.push('ledgerMaskBits');
-    }}
-    fs.writeFileSync(userFile, JSON.stringify(trades, null, 2));
-    console.log('Early sell simulated and recorded. Updated trades:', trades.filter(t=>t.mode==='sell'));
-  } else {
-    console.log('Early execution conditions not met. No sell simulated.');
-  }
-
-  process.exit(0);
+async function fetchRecentTxForMint(mint:string){
+  try{
+    const conn = rpcPool.getRpcConnection({ commitment: 'finalized' });
+    const sigs = await (conn as any).getSignaturesForAddress(new PublicKey(mint), { limit: 20 });
+    if(!sigs || sigs.length===0) return null;
+    for(const s of sigs){
+      try{
+        const tx = await (conn as any).getParsedTransaction(s.signature, { commitment: 'finalized', maxSupportedTransactionVersion: 0 });
+        if(tx) return { tx, sig: s.signature, slot: s.slot, blockTime: s.blockTime };
+      }catch(e){ /* continue */ }
+      await sleep(150);
+    }
+  }catch(e){ /* ignore */ }
+  return null;
 }
 
-main().catch((e)=>{ console.error('Error', e); process.exit(1); });
+async function countHolders(mint:string){
+  try{
+    const conn = rpcPool.getRpcConnection({ commitment: 'finalized' }) as any;
+    const TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+    // fetch parsed token accounts for this mint (may be heavy; limited by RPC)
+    const resp = await conn.getParsedProgramAccounts(TOKEN_PROGRAM, { filters: [ { memcmp: { offset: 0, bytes: mint } }, { dataSize: 165 } ] });
+    if(!resp || !Array.isArray(resp)) return 0;
+    let count = 0;
+    for(const acc of resp){
+      try{
+        const info = acc.account && acc.account.data && acc.account.data.parsed && acc.account.data.parsed.info;
+        const amt = info && info.tokenAmount && (typeof info.tokenAmount.uiAmount === 'number') ? Number(info.tokenAmount.uiAmount) : 0;
+        if(amt && amt > 0) count++;
+      }catch(e){}
+    }
+    return count;
+  }catch(e){ return -1; }
+}
+
+async function inspectMint(mint:string){
+  const conn = rpcPool.getRpcConnection({ commitment: 'finalized' });
+  let accountInfo = null as any;
+  try{ accountInfo = await conn.getAccountInfo(new PublicKey(mint)); }catch(e){}
+  let decoded = null;
+  try{ if(accountInfo && accountInfo.data){ const Buffer = require('buffer').Buffer; const layout = require('@solana/buffer-layout'); const { struct, u32, u8 } = layout; } }catch(e){}
+  return { accountInfo };
+}
+
+function bitListFromMask(mask:number){ const bits:number[]=[]; let idx=0; let m=mask; while(m){ if(m&1) bits.push(idx); idx++; m>>>=1; } return bits; }
+
+async function main(){
+  const samplesPath = path.join(__dirname, 'raw_samples_only.json');
+  if(!fs.existsSync(samplesPath)) throw new Error('raw_samples_only.json missing');
+  const samples = JSON.parse(fs.readFileSync(samplesPath,'utf8')) as any[];
+  const mint = process.argv[2] || samples[0].mint;
+  console.log('Running live fetch+simulate for mint', mint);
+
+  // recent tx
+  const fetched = await fetchRecentTxForMint(mint);
+  console.log('Recent tx fetch:', fetched ? `sig=${fetched.sig} slot=${fetched.slot} time=${new Date((fetched.blockTime||0)*1000).toISOString()}` : 'none');
+
+  // count holders
+  const holders = await countHolders(mint);
+  console.log('Holders count (token accounts with balance>0):', holders);
+
+  // liquidity via Jupiter (estimate price in SOL for small trade)
+  let liq:any = null;
+  try{ liq = await liquidity.checkLiquidityOnJupiter(mint, 1); }catch(e){ liq = { tradable:false, note: String(e) }; }
+  console.log('Liquidity check (Jupiter):', liq && liq.tradable ? `tradable, estPriceSol=${liq.estimatedPriceSol} priceImpact=${liq.priceImpact}` : `not tradable (${liq && liq.note})`);
+
+  // creation / launch recency: attempt earliest signature
+  let createdAt = null;
+  try{
+    const conn = rpcPool.getRpcConnection({ commitment: 'finalized' });
+    const sigs = await conn.getSignaturesForAddress(new PublicKey(mint), { limit: 1000 });
+    if(sigs && sigs.length){ const last = sigs[sigs.length-1]; createdAt = last.blockTime ? new Date(last.blockTime*1000).toISOString() : null; }
+  }catch(e){}
+  console.log('Approx creation time (earliest signature in limited window):', createdAt || 'unknown');
+
+  // run engine + aggregator probe
+  // reset aggregator state for deterministic output
+  try{ (aggregator as any).map = new Map(); (aggregator as any).seenSigs = new Map(); }catch(e){}
+  const engine = new LedgerSignalEngine({ windowSlots: 5, densityThreshold: 2, requiredBits: 2 });
+
+  // If we got a recent tx, feed it into engine
+  if(fetched && fetched.tx){
+    const ev:any = { slot: fetched.slot || Date.now()%1_000_000, freshMints: [mint], sampleLogs: JSON.stringify(fetched.tx || {}), solletCreated: false, transaction: fetched.tx.transaction || null, meta: fetched.tx.meta || null };
+    engine.processEvent(ev);
+  }
+
+  const mask = engine.getMaskForMint(mint, null);
+  console.log('Derived ledger mask from engine:', mask, 'bits:', bitListFromMask(mask));
+
+  // Simulate a buy via aggregator and engine as demonstration
+  const lw = require('../src/ledgerWeights');
+  const buyMask = (lw.BIT_FIRST_BUY_MEDIUM || 0) | (lw.BIT_FIRST_BUY || 0) | (lw.BIT_SWAP_DETECTED || 0) | (lw.BIT_SOLLET_CREATED || 0);
+  aggregator.addSample(mint, { ledgerMask: buyMask, ledgerStrong: true, solletCreatedHere: true, sig: 'sim-buy-1' });
+  engine.processEvent({ slot: Date.now()%1_000_000 + 1, freshMints: [mint], sampleLogs: 'simulated buy', solletCreated: true, transaction: null, meta: null });
+
+  const agg = aggregator.getAggregated(mint);
+  const weights = require('../src/ledgerWeights').LEDGER_WEIGHTS_BY_INDEX || require('../src/ledgerWeights').LEDGER_WEIGHTS_BY_BIT;
+  const score = aggregator.computeScoreFromWeights(agg.aggregatedMask, weights);
+
+  console.log('\n=== After simulated BUY ===');
+  console.log('Aggregated Mask:', agg.aggregatedMask, 'bits:', bitListFromMask(agg.aggregatedMask));
+  console.log('BitCounts:', agg.bitCounts);
+  console.log('SolletCreatedHere:', agg.solletCreatedHere, 'LedgerStrong:', agg.ledgerStrong);
+  console.log('Score:', score.toFixed(3));
+}
+
+main().catch(e=>{ console.error('Error', e); process.exit(1); });

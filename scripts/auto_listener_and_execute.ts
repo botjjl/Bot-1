@@ -7,6 +7,7 @@ const { unifiedBuy } = require('../src/tradeSources');
 const { loadKeypair } = require('../src/wallet');
 const rpcPool = require('../src/utils/rpcPool').default || require('../src/utils/rpcPool');
 const ledgerAggregator = require('../src/ledgerWindowAggregator').default;
+import { LEDGER_BIT_BASE_SHIFT, LEDGER_WEIGHTS_BY_INDEX } from '../src/ledgerWeights';
 
 async function sleep(ms:number){ return new Promise(r=>setTimeout(r,ms)); }
 
@@ -76,32 +77,7 @@ async function main(){
           totalAggCountSum += agg.count || 0;
           if(agg.solletCreatedHere) solletCount++;
           if((agg.aggregatedMask||0) !== 0) ledgerEvidenceCount++;
-          // compute aggregated score using bit-indexed weights (bit index = LEDGER_BIT_BASE_SHIFT + offset)
-          // compute simple ledger score using same weights as engine
-          const LEDGER_BIT_BASE_SHIFT = 6;
-          const BIT_ACCOUNT_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 0);
-          const BIT_ATA_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 1);
-          const BIT_SAME_AUTH = 1 << (LEDGER_BIT_BASE_SHIFT + 2);
-          const BIT_PROGRAM_INIT = 1 << (LEDGER_BIT_BASE_SHIFT + 3);
-          const BIT_SLOT_DENSE = 1 << (LEDGER_BIT_BASE_SHIFT + 4);
-          const BIT_LP_STRUCT = 1 << (LEDGER_BIT_BASE_SHIFT + 5);
-          const BIT_CLEAN_FUNDING = 1 << (LEDGER_BIT_BASE_SHIFT + 6);
-          const BIT_SLOT_ALIGNED = 1 << (LEDGER_BIT_BASE_SHIFT + 7);
-          const BIT_CREATOR_EXPOSED = 1 << (LEDGER_BIT_BASE_SHIFT + 8);
-          const BIT_SOLLET_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 9);
-          const LEDGER_WEIGHTS_BY_INDEX:any = {};
-          // map weights by bit index (base shift + offset)
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 0] = 0.06; // account created
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 1] = 0.05; // ata
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 2] = 0.04; // same auth
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 3] = 0.05; // program init
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 4] = 0.05; // slot dense
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 5] = 0.07; // lp struct
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 6] = 0.08; // clean funding
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 7] = 0.06; // slot aligned
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 8] = 0.08; // creator exposed
-          LEDGER_WEIGHTS_BY_INDEX[LEDGER_BIT_BASE_SHIFT + 9] = 0.06; // sollet created
-
+          // compute aggregated score using centralized weights
           const aggregatedScore = ledgerAggregator.computeScoreFromWeights(agg.aggregatedMask, LEDGER_WEIGHTS_BY_INDEX);
           // aggregated popcount
           let aggMask = agg.aggregatedMask || 0; let aggBits = 0; while(aggMask){ aggBits += aggMask & 1; aggMask >>= 1; }

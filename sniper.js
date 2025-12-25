@@ -77,7 +77,9 @@ const INMEM_NOTIF_MAX = Number(process.env.NOTIF_INMEM_MAX || 50);
 let _tokenUtils = null;
 try{ _tokenUtils = require('../src/utils/tokenUtils'); }catch(e){}
 
-const PROGRAMS = [
+// Programs to listen to. Can be overridden via env `KNOWN_AMM_PROGRAM_IDS` (comma-separated).
+const envPrograms = (process.env.KNOWN_AMM_PROGRAM_IDS || process.env.PROGRAMS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
+const PROGRAMS = envPrograms.length ? envPrograms : [
   '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp',
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
 ];

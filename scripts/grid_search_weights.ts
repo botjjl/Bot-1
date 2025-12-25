@@ -1,9 +1,9 @@
 #!/usr/bin/env ts-node
 import fs from 'fs';
 import path from 'path';
+import { LEDGER_BIT_BASE_SHIFT, LEDGER_WEIGHTS_BY_INDEX } from '../src/ledgerWeights';
 
 const SAMPLE_PATH = path.join(__dirname, '../src/simulation/sample_mints_enriched.json');
-const LEDGER_BIT_BASE_SHIFT = 6;
 const BIT_SOLLET_IDX = LEDGER_BIT_BASE_SHIFT + 9;
 
 type Sample = any;
@@ -94,17 +94,9 @@ function coordDescent(byMint: any[], baseWeights: Record<number,number>, candida
 function main(){
   const samples = parseSamples();
   const byMint = aggregateByMint(samples, 30_000);
+  // start from centralized ledger weights (copy to avoid mutation)
   const baseWeights: Record<number,number> = {};
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 0] = 0.06;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 1] = 0.05;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 2] = 0.04;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 3] = 0.05;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 4] = 0.05;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 5] = 0.07;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 6] = 0.08;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 7] = 0.06;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 8] = 0.08;
-  baseWeights[LEDGER_BIT_BASE_SHIFT + 9] = 0.06; // sollet
+  for(const k of Object.keys(LEDGER_WEIGHTS_BY_INDEX)) baseWeights[Number(k)] = LEDGER_WEIGHTS_BY_INDEX[Number(k)];
 
   const candidates = [0,0.5,1,1.5,2];
   const threshold = Number(process.env.LEDGER_EARLY_SCORE_THRESHOLD || 0.06);

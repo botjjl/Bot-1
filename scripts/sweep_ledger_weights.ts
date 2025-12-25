@@ -1,6 +1,7 @@
 #!/usr/bin/env ts-node
 import fs from 'fs';
 import path from 'path';
+import { LEDGER_BIT_BASE_SHIFT, LEDGER_WEIGHTS_BY_INDEX } from '../src/ledgerWeights';
 
 const SAMPLE_PATH = path.join(__dirname, '../src/simulation/sample_mints_enriched.json');
 
@@ -11,7 +12,6 @@ function parseSamples(): Sample[]{
   return JSON.parse(raw);
 }
 
-const LEDGER_BIT_BASE_SHIFT = 6;
 const bitNames: Record<number,string> = {};
 bitNames[LEDGER_BIT_BASE_SHIFT + 0] = 'ACCOUNT_CREATED';
 bitNames[LEDGER_BIT_BASE_SHIFT + 1] = 'ATA_CREATED';
@@ -24,17 +24,9 @@ bitNames[LEDGER_BIT_BASE_SHIFT + 7] = 'SLOT_ALIGNED';
 bitNames[LEDGER_BIT_BASE_SHIFT + 8] = 'CREATOR_EXPOSED';
 bitNames[LEDGER_BIT_BASE_SHIFT + 9] = 'SOLLET_CREATED';
 
+// copy centralized base weights
 const BASE_WEIGHTS: Record<number,number> = {};
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 0] = 0.06;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 1] = 0.05;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 2] = 0.04;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 3] = 0.05;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 4] = 0.05;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 5] = 0.07;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 6] = 0.08;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 7] = 0.06;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 8] = 0.08;
-BASE_WEIGHTS[LEDGER_BIT_BASE_SHIFT + 9] = 0.06;
+for(const k of Object.keys(LEDGER_WEIGHTS_BY_INDEX)) BASE_WEIGHTS[Number(k)] = LEDGER_WEIGHTS_BY_INDEX[Number(k)];
 
 function epochMs(t?: string | number | null){ if(!t) return 0; if(typeof t === 'number') return t; return new Date(t).getTime(); }
 

@@ -39,7 +39,7 @@ async function main(){
 
   // Now call monitor to immediately execute sells (will perform real unifiedSell using same secret)
   try{
-    await monitorAndAutoSellTrades(user, [ { address: tok.mint, ledgerMask: tok.ledgerMask, ledgerStrong: tok.ledgerStrong, solletCreatedHere: tok.solletCreatedHere, price: tok.price || 1, address: tok.mint } ]);
+    await monitorAndAutoSellTrades(user, [ { address: tok.mint, ledgerMask: tok.ledgerMask, ledgerStrong: tok.ledgerStrong, solletCreatedHere: tok.solletCreatedHere, price: tok.price || 1 } ]);
     console.log('monitorAndAutoSellTrades completed');
   }catch(e){ console.error('Monitor sell failed', e); }
 
