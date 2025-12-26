@@ -16,11 +16,9 @@ const { LedgerSignalEngine } = require('./ledger_signal_engine');
 
 (async ()=>{
   const RPC = process.env.SOLANA_RPC_URL || process.env.HELIUS_RPC_URL || 'https://api.mainnet-beta.solana.com';
-  const PROGS = (process.env.PROGRAMS || process.env.PROGRAMS_LIST || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
-  if(!PROGS.length){
-    console.error('No programs provided. Set PROGRAMS env to a comma-separated list of program IDs.');
-    process.exit(1);
-  }
+  // Use canonical program list only (ignore env overrides)
+  const DEFAULT_PROGS = ['9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp','6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'];
+  const PROGS = DEFAULT_PROGS.slice();
   const conn = new Connection(RPC, 'confirmed');
   const eng = new LedgerSignalEngine({ windowSlots: 5, densityThreshold: 2 });
 

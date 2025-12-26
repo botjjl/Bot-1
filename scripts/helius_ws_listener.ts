@@ -25,14 +25,14 @@ async function main(){
     console.log('WS open');
     // subscribe to logs. Prefer restricting by program ids when provided in env
     try{
-      const progs = (process.env.KNOWN_AMM_PROGRAM_IDS || process.env.PROGRAMS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
+      // Prefer env override, otherwise subscribe only to the canonical program list.
+      const DEFAULT_PROGS = ['9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp','6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'];
+      // Force using canonical program list only (ignore env overrides)
+      const progs = DEFAULT_PROGS.slice();
       if(progs && progs.length){
-        console.log('Subscribing to logs mentioning programs:', progs);
-        const sub = { jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: [ { mentions: progs }, { commitment: 'finalized', encoding: 'jsonParsed' } ] };
-        ws.send(JSON.stringify(sub));
-      } else {
-        console.log('No program filter provided; subscribing to all logs');
-        const sub = { jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: [ { mentions: [] }, { commitment: 'finalized', encoding: 'jsonParsed' } ] };
+        console.log('Subscribing to logs for canonical programs only:', progs);
+        // Use 'processed' commitment to minimize latency (earliest practical signal)
+        const sub = { jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: [ { mentions: progs }, { commitment: 'processed', encoding: 'jsonParsed' } ] };
         ws.send(JSON.stringify(sub));
       }
     }catch(e){ console.error('WS subscribe send failed', e); }
@@ -143,15 +143,143 @@ async function main(){
 
               // for each mint, emit aggregator sample
               const aggregator = require('../src/ledgerWindowAggregator').default;
-              for(const mint of mints){
+
+              // Local helpers: determine explicit kind and whether a mint was created in this tx
+              const txKindLocal = (ttx:any) => {
+                try{
+                  const meta = ttx && (ttx.meta || (ttx.transaction && ttx.meta)) || {};
+                  const logsAll = Array.isArray(meta.logMessages)? meta.logMessages.join('\n').toLowerCase() : '';
+                  if(logsAll.includes('instruction: initializemint') || logsAll.includes('initialize mint') || logsAll.includes('instruction: initialize_mint')) return 'initialize';
+                  if(logsAll.includes('createpool') || logsAll.includes('initializepool') || logsAll.includes('create pool')) return 'pool_creation';
+                  if(logsAll.includes('instruction: swap') || logsAll.includes('\nprogram log: instruction: swap') || logsAll.includes(' swap ')) return 'swap';
+                  const msg = ttx && (ttx.transaction && ttx.transaction.message) || ttx.transaction || {};
+                  const instrs = (msg && msg.instructions) || [];
+                  for(const ins of instrs){ try{ const t = (ins.parsed && ins.parsed.type) || (ins.type || ''); if(!t) continue; const lt = String(t).toLowerCase(); if(lt.includes('initializemint')||lt.includes('initialize_mint')||lt.includes('initialize mint')) return 'initialize'; if(lt.includes('createpool')||lt.includes('initializepool')||lt.includes('create pool')) return 'pool_creation'; if(lt.includes('swap')) return 'swap'; }catch(e){} }
+                }catch(e){}
+                return null;
+              };
+              const isMintCreatedInThisTxLocal = (ttx:any, mint:string) => {
+                try{
+                  if(!ttx) return false;
+                  const logsAll = (ttx.logs || (ttx.value && ttx.value.logs) || []).join('\n').toLowerCase();
+                  const m = String(mint).toLowerCase();
+                  if(logsAll.includes('instruction: initializemint') || logsAll.includes('initialize mint') || logsAll.includes('initialize_mint') || logsAll.includes('createidempotent')) return true;
+                  if(m && logsAll.includes(m)) return true;
+                  const msg = ttx && (ttx.transaction && ttx.transaction.message) || ttx.transaction || {};
+                  const instrs = (msg && msg.instructions) || [];
+                  for(const ins of instrs){
+                    try{
+                      const t = (ins.parsed && ins.parsed.type) || (ins.type || '');
+                      if(t && String(t).toLowerCase().includes('initializemint')) return true;
+                      const info = ins.parsed && ins.parsed.info;
+                      if(info){ if(info.mint && String(info.mint).toLowerCase() === m) return true; if(info.newAccount && String(info.newAccount).toLowerCase() === m) return true; }
+                    }catch(e){}
+                  }
+                }catch(e){}
+                return false;
+              };
+
+              const kind = txKindLocal(tx);
+              // Filter to only mints that were created/initialized in this transaction
+              const createdMints: string[] = [];
+              for(const mint of mints){ try{ if(isMintCreatedInThisTxLocal(tx, mint)) createdMints.push(mint); }catch(_e){} }
+
+              // Only add samples and feed engine when we detect an initialize or created mints
+              if(kind === 'initialize' || (Array.isArray(createdMints) && createdMints.length>0)){
                 const sigVal = signature || (res && res.value && res.value.signature) || null;
-                const s: any = { ledgerMask: relMask, ledgerStrong: false, solletCreatedHere: !!isSollet, sig: sigVal };
-                aggregator.addSample(mint, s);
+                for(const mint of createdMints){
+                  const s: any = { ledgerMask: relMask, ledgerStrong: false, solletCreatedHere: !!isSollet, sig: sigVal };
+                  try{ aggregator.addSample(mint, s); }catch(_e){}
+                }
+                const ev: any = { slot: slot || (tx.slot || 0), freshMints: createdMints, sampleLogs: logs.join('\n'), solletCreated: !!isSollet, transaction: tx.transaction || null, meta: tx.meta || null };
+                  try{ engine.processEvent(ev); }catch(_e){}
+
+                // FAST MASK-BASED EXECUTION PATH (no additional on-chain metadata required)
+                try{
+                  const ENABLE_FAST_MASK_EXEC = (process.env.ENABLE_FAST_MASK_EXEC === 'true');
+                  if(ENABLE_FAST_MASK_EXEC){
+                    // Determine required mask bits/count from env
+                    const REQ_MASK_BITS = (process.env.MASK_REQUIRED_BITS || '').toString().split(',').map(s=>s.trim()).filter(Boolean).map(Number).filter(n=>!Number.isNaN(n));
+                    const REQ_MASK_MIN_COUNT = Number(process.env.MASK_REQUIRED_MIN_COUNT || 2);
+                    // For each created mint, check ledger mask and strength
+                    for(const mm of createdMints){
+                      try{
+                        const slotNum = slot || (tx && tx.slot) || null;
+                        const mask = engine.getMaskForMint(mm, slotNum);
+                        const strong = engine.isStrongSignal(mm, slotNum);
+                        // compute bit match count
+                        let matchCount = 0;
+                        if(Array.isArray(REQ_MASK_BITS) && REQ_MASK_BITS.length>0){
+                          for(const b of REQ_MASK_BITS){ if(mask & (1<<b)) matchCount++; }
+                        } else {
+                          // fallback: count non-zero bits in mask's interesting range (6-14)
+                          for(let b=6;b<=14;b++) if(mask & (1<<b)) matchCount++;
+                        }
+                        const meets = (matchCount >= REQ_MASK_MIN_COUNT) && (!!strong || matchCount >= REQ_MASK_MIN_COUNT+1);
+                        if(meets){
+                          // Trigger immediate execution for confirmed users (same logic as below, but skip tx/meta fetch)
+                          const AUTO_EXEC_CONFIRM_USER_IDS = (process.env.AUTO_EXEC_CONFIRM_USER_IDS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
+                          if(AUTO_EXEC_CONFIRM_USER_IDS.length>0){
+                            const usersPath = require('path').join(process.cwd(), 'users.json');
+                            let users = {};
+                            try{ users = JSON.parse(require('fs').readFileSync(usersPath,'utf8')||'{}'); }catch(_e){ users = {}; }
+                            const autoExecMod = require('../src/autoStrategyExecutor');
+                            for(const uid of AUTO_EXEC_CONFIRM_USER_IDS){
+                              try{
+                                const user = users[uid];
+                                if(!user) continue;
+                                if(!(user && (user.secret || user.wallet))) continue;
+                                const execTok = { mint: mm, tokenAddress: mm, address: mm, sampleLogs: logs.join('\n'), ledgerMask: mask, ledgerStrong: strong, __listenerCollected: true };
+                                // run async and non-blocking; pass listenerBypass to prioritize immediate path
+                                (async ()=>{
+                                  try{ await autoExecMod.autoExecuteStrategyForUser(user, [execTok], 'buy', { listenerBypass: true, forceAllowSignal: true }); }
+                                  catch(e){ try{ console.error('[helius_ws_listener:fastMaskExec] error', e && e.message || e); }catch(_){} }
+                                })();
+                              }catch(_e){}
+                            }
+                          }
+                        }
+                      }catch(_e){}
+                    }
+                  }
+                }catch(_e){}
               }
 
-              // also feed engine for demonstration
-              const ev: any = { slot: slot || (tx.slot || 0), freshMints: mints, sampleLogs: logs.join('\n'), solletCreated: !!isSollet, transaction: tx.transaction || null, meta: tx.meta || null };
-              engine.processEvent(ev);
+              // Optional: immediate auto-exec hook for confirmed users
+              try{
+                const AUTO_EXEC_ENABLED = (process.env.ENABLE_AUTO_EXEC_FROM_LISTENER === 'true');
+                const AUTO_EXEC_CONFIRM_USER_IDS = (process.env.AUTO_EXEC_CONFIRM_USER_IDS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
+                if(AUTO_EXEC_ENABLED && AUTO_EXEC_CONFIRM_USER_IDS.length>0){
+                  try{
+                    const usersPath = require('path').join(process.cwd(), 'users.json');
+                    let users = {};
+                    try{ users = JSON.parse(require('fs').readFileSync(usersPath,'utf8')||'{}'); }catch(_e){ users = {}; }
+                    const autoExecMod = require('../src/autoStrategyExecutor');
+                    for(const uid of AUTO_EXEC_CONFIRM_USER_IDS){
+                      try{
+                        const user = users[uid];
+                        if(!user) continue;
+                        // require credentials present
+                        if(!(user && (user.secret || user.wallet))) continue;
+                        // Only consider created mints (or any when explicit initialize)
+                        if(!(kind === 'initialize' || (Array.isArray(createdMints) && createdMints.length>0))) continue;
+                        // build lightweight token objects for immediate execution
+                        const execTokens = (createdMints || []).map((mm:string)=>{
+                          const tok:any = { mint: mm, tokenAddress: mm, address: mm, sampleLogs: logs.join('\n') };
+                          try{ tok.ledgerMask = engine.getMaskForMint(mm, slot || (tx && tx.slot) || null); }catch(_e){}
+                          try{ tok.ledgerStrong = engine.isStrongSignal(mm, slot || (tx && tx.slot) || null); }catch(_e){}
+                          return tok;
+                        });
+                        // run in background, listenerBypass to favor immediate execution
+                        (async ()=>{
+                          try{ await autoExecMod.autoExecuteStrategyForUser(user, execTokens, 'buy', { listenerBypass: true, forceAllowSignal: true }); }
+                          catch(e){ try{ console.error('[helius_ws_listener:autoExec] error', e && e.message || e); }catch(_){} }
+                        })();
+                      }catch(_e){}
+                    }
+                  }catch(_e){}
+                }
+              }catch(_e){}
             }
           }catch(e){ /* ignore */ }
         })();

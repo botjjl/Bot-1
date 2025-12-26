@@ -49,12 +49,21 @@ async function getFirstSignatureCached(mint){
   }catch(e){ FIRST_SIG_CACHE.set(mint, { ts: now, val: null }); return null; }
 }
 
-async function mintPreviouslySeen(mint, txBlockTime, currentSig){
+// Prefer slot comparison when available, fallback to blockTime. Returns true/false/null
+async function mintPreviouslySeen(mint, txSlot, txBlockTime, currentSig){
   if(!mint) return true;
   try{
     const sigs = await heliusRpc('getSignaturesForAddress', [mint, { limit: 8 }]);
     if(!Array.isArray(sigs) || sigs.length===0) return false;
-    for(const s of sigs){ const sig = s.signature || s.sig || s.txHash || null; const bt = s.blockTime || s.block_time || s.blocktime || null; if(sig && sig!==currentSig && bt && txBlockTime && bt < txBlockTime) return true; }
+    for(const s of sigs){
+      try{
+        const sig = s.signature || s.sig || s.txHash || null;
+        const sSlot = s.slot || s.blockSlot || null;
+        const bt = s.blockTime || s.block_time || s.blocktime || null;
+        if(sig && sig !== currentSig && sSlot && txSlot && Number(sSlot) < Number(txSlot)) return true;
+        if(sig && sig !== currentSig && bt && txBlockTime && Number(bt) < Number(txBlockTime)) return true;
+      }catch(e){}
+    }
     return false;
   }catch(e){ return null; }
 }
@@ -129,7 +138,9 @@ class ProgramMonitor extends EventEmitter {
         for(const m of ev.freshMints.slice(0,3)){
           try{
             const first = await getFirstSignatureCached(m);
-            const prev = await mintPreviouslySeen(m, ev.blockTime || ev.txBlock || (first && first.blockTime) || null, ev.signature || ev.sig || null).catch(()=>null);
+            const txSlotLocal = (first && first.slot) ? first.slot : (ev && (ev.slot || ev.blockSlot || ev.blockNumber) || null);
+            const txBlockTime = ev.blockTime || ev.txBlock || (first && first.blockTime) || null;
+            const prev = await mintPreviouslySeen(m, txSlotLocal, txBlockTime, ev.signature || ev.sig || null).catch(()=>null);
             // run Jupiter quote to estimate tradability and price-impact
             let jres = null;
             try{

@@ -185,7 +185,9 @@ class ProgramFSM extends EventEmitter {
   constructor(opts={}){
     super();
     this.states = new Map(); // mint -> { mask, slot, lastSeenTs }
-    this.programs = opts.programs || []; // optional filter of program IDs
+    // Force canonical program list only (ignore env overrides)
+    const DEFAULT_PROGS = ['9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp','6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'];
+    this.programs = (Array.isArray(opts.programs) && opts.programs.length>0) ? opts.programs : DEFAULT_PROGS; // optional filter of program IDs
     this.ledger = new LedgerSignalEngine({ windowSlots: (opts && opts.slotWindow) || 3, densityThreshold: (opts && opts.densityThreshold) || 3 });
     this._onEvent = this._onEvent.bind(this);
     this._logSubs = [];

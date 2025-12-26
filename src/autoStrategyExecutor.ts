@@ -46,9 +46,10 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
             const sniperMod = require('../sniper');
             const eng = sniperMod && sniperMod.ledgerEngine;
             if (eng && typeof eng.getMaskForMint === 'function') {
-              const txBlock = token.txBlock || null;
-              const mask = eng.getMaskForMint(token.mint || token.address || token.tokenAddress, txBlock);
-              const strong = eng.isStrongSignal(token.mint || token.address || token.tokenAddress, txBlock);
+              // prefer numeric slot when available; fall back to txBlock timestamp
+              const txSlot = token.slot || token.txSlot || null;
+              const mask = eng.getMaskForMint(token.mint || token.address || token.tokenAddress, txSlot);
+              const strong = eng.isStrongSignal(token.mint || token.address || token.tokenAddress, txSlot);
               const solletFlag = !!token.solletCreatedHere || false;
               token.ledgerMask = Number(mask || 0);
               token.ledgerStrong = !!strong;

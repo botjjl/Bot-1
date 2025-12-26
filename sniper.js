@@ -83,10 +83,11 @@ try{ _tokenUtils = require('../src/utils/tokenUtils'); }catch(e){}
 const AUTO_EXEC_USER_LOCKS = new Map(); // userId -> true
 const AUTO_EXEC_TOKEN_LOCKS = new Map(); // tokenAddr -> expiryMs
 const AUTO_EXEC_TOKEN_LOCK_MS = Number(process.env.AUTO_EXEC_TOKEN_LOCK_MS) || 10000;
+// Execution idempotency map to avoid re-executing same mint+slot+sig across races
+const EXEC_IDEMPOTENCY = new Map(); // execKey -> expiryMs
 
-// Programs to listen to. Can be overridden via env `KNOWN_AMM_PROGRAM_IDS` (comma-separated).
-const envPrograms = (process.env.KNOWN_AMM_PROGRAM_IDS || process.env.PROGRAMS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
-const PROGRAMS = envPrograms.length ? envPrograms : [
+// Programs to listen to. Force canonical program list only (ignore env overrides).
+const PROGRAMS = [
   '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp',
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
 ];
@@ -164,11 +165,28 @@ async function isOnChainMintAddress(addr){
     try{
       if(res && res.value){
         const data = res.value.data;
+        // base64 array response
         if(Array.isArray(data) && typeof data[0] === 'string'){
           const buf = Buffer.from(data[0], 'base64');
-          // SPL Mint account layout size is 82 bytes
-          if(buf && buf.length === 82) isMint = true;
+          if(buf && buf.length >= 82) isMint = true;
         }
+        // jsonParsed response with parsed.type === 'mint'
+        try{
+          if(data && data.parsed && data.parsed.type && String(data.parsed.type).toLowerCase() === 'mint') isMint = true;
+        }catch(_e){}
+        // Some RPCs return structured account objects; also accept when owner equals token program id
+        const owner = (res.value && (res.value.owner || res.value.ownerPubkey || res.value.owner_program)) || null;
+        const ownerStr = owner ? String(owner).toLowerCase() : '';
+        if(!isMint && ownerStr && ownerStr.includes('tokenkeg')) isMint = true;
+      }
+      // Fallback: try jsonParsed encoding to get structured parsed.account info
+      if(!isMint){
+        try{
+          const parsedRes = await heliusRpc('getAccountInfo', [addr, { encoding: 'jsonParsed' }]);
+          if(parsedRes && parsedRes.value && parsedRes.value.data && parsedRes.value.data.parsed && parsedRes.value.data.parsed.type && String(parsedRes.value.data.parsed.type).toLowerCase() === 'mint'){
+            isMint = true;
+          }
+        }catch(_e){}
       }
     }catch(e){}
     MINT_ADDRESS_CACHE.set(addr, { isMint: !!isMint, ts: Date.now() });
@@ -378,6 +396,27 @@ function isMintCreatedInThisTx(tx, mint){
     if(logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('initialize_mint') || logs.includes('createidempotent')) return true;
     // sometimes log messages include the mint address when created
     if(m && logs.includes(m)) return true;
+    // Also inspect token balance diffs: if postTokenBalances contains mint but preTokenBalances does not, treat as created
+    try{
+      const meta = tx && (tx.meta || (tx.transaction && tx.meta)) || {};
+      const post = Array.isArray(meta.postTokenBalances) ? meta.postTokenBalances : [];
+      const pre = Array.isArray(meta.preTokenBalances) ? meta.preTokenBalances : [];
+      for(const p of post){
+        try{
+          if(!p || !p.mint) continue;
+          if(String(p.mint).toLowerCase() !== m) continue;
+          // find matching pre entry by accountIndex/pubkey/owner
+          const match = (pre || []).find(x => x && (x.accountIndex === p.accountIndex || x.pubkey === p.pubkey || x.owner === p.owner));
+          if(!match) return true;
+          // if pre amount is zero or undefined and post amount > 0, consider it created
+          try{
+            const postAmt = p.uiTokenAmount && typeof p.uiTokenAmount.uiAmount === 'number' ? Number(p.uiTokenAmount.uiAmount) : (p.uiTokenAmount && p.uiTokenAmount.amount ? Number(p.uiTokenAmount.amount) : null);
+            const preAmt = match && match.uiTokenAmount && typeof match.uiTokenAmount.uiAmount === 'number' ? Number(match.uiTokenAmount.uiAmount) : (match && match.uiTokenAmount && match.uiTokenAmount.amount ? Number(match.uiTokenAmount.amount) : null);
+            if((preAmt === null || preAmt === 0) && postAmt && postAmt > 0) return true;
+          }catch(_e){}
+        }catch(_e){}
+      }
+    }catch(_e){}
     // inspect parsed instructions for initialize mint
     const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
     const instrs = (msg && msg.instructions) || [];
@@ -390,26 +429,43 @@ function isMintCreatedInThisTx(tx, mint){
           if(info.mint && String(info.mint).toLowerCase() === m) return true;
           if(info.newAccount && String(info.newAccount).toLowerCase() === m) return true;
         }
+        // also check for createAccount/init instructions where the new account equals the mint
+        try{
+          const parsed = ins.parsed || {};
+          if(parsed && parsed.type && String(parsed.type).toLowerCase().includes('create')){
+            const inf = parsed.info || {};
+            if(inf && (String(inf.newAccount || inf.account || '').toLowerCase() === m || String(inf.mint || '').toLowerCase() === m)) return true;
+          }
+        }catch(_e){}
       }catch(e){}
     }
   }catch(e){}
   return false;
 }
 
-async function mintPreviouslySeen(mint, txBlockTime, currentSig){
+// Check whether a mint has been seen before. Prefer comparing ledger `slot` when available,
+// otherwise fall back to `blockTime` comparison. Returns `true` (seen), `false` (not seen), or `null` (unknown/error).
+async function mintPreviouslySeen(mint, txSlot, txBlockTime, currentSig){
   if(!mint) return true;
   try{
     // reduced limit to lower RPC cost; configurable via MINT_SIG_LIMIT
     const sigs = await heliusRpc('getSignaturesForAddress', [mint, { limit: MINT_SIG_LIMIT }]);
     if(!Array.isArray(sigs) || sigs.length===0) return false;
     for(const s of sigs){
-      try{ const sig = getSig(s); const bt = s.blockTime||s.block_time||s.blocktime||null; if(sig && sig!==currentSig && bt && txBlockTime && bt < txBlockTime) return true; }catch(e){}
+      try{
+        const sig = getSig(s);
+        const sSlot = s.slot || s.blockSlot || null;
+        const bt = s.blockTime||s.block_time||s.blocktime||null;
+        // Prefer slot-based comparison when both sides provide slot information
+        if(sig && sig !== currentSig && sSlot && txSlot && Number(sSlot) < Number(txSlot)) return true;
+        // Fallback to blockTime comparison when slot not available
+        if(sig && sig !== currentSig && bt && txBlockTime && Number(bt) < Number(txBlockTime)) return true;
+      }catch(e){}
     }
     return false;
   }catch(e){
     // On RPC/network errors return `null` to indicate unknown previous-seen status.
-    // Previously we returned `true` which could cause false-negatives during rate-limits.
-    try{ console.error('mintPreviouslySeen RPC error for', String(mint).slice(0,8), (e && e.message) || e); }catch(_){}
+    try{ console.error('mintPreviouslySeen RPC error for', String(mint).slice(0,8), (e && e.message) || e); }catch(_){ }
     return null;
   }
 }
@@ -490,7 +546,10 @@ async function startSequentialListener(options){
               continue;
             }
             const fresh = [];
-            const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
+            // txBlock: timestamp (blockTime) used for age calculations
+            const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&& (tx.blockTime || (tx.meta && tx.meta.blockTime)))||null;
+            // txSlot: ledger slot number when available (preferred for ledger engine mask calculations)
+            const txSlot = (tx && (tx.slot || (tx.meta && tx.meta.slot))) || (s && (s.slot || s.blockSlot)) || null;
             for(const m of mints){
               try{
                 if(seenMints.has(m)) continue;
@@ -526,7 +585,8 @@ async function startSequentialListener(options){
                     const createdHere = isMintCreatedInThisTx(tx, m);
                     if(createdHere){
                       // Strong creation indicator -> accept candidate and defer strict age filtering to user strategies.
-                      const prev = await mintPreviouslySeen(m, txBlock, sig);
+                      const txSlotLocal = (tx && (tx.slot || (tx.meta && tx.meta.slot))) || (s && (s.slot || s.blockSlot)) || null;
+                      const prev = await mintPreviouslySeen(m, txSlotLocal, txBlock, sig);
                       // If prev === false -> definitely not seen before -> accept.
                       // If prev === null -> unknown due to RPC error -> treat as unknown and accept to avoid false-negatives.
                       if(prev === false || prev === null) accept = true;
@@ -651,8 +711,10 @@ async function startSequentialListener(options){
                     try{
                       const mint = t && (t.tokenAddress || t.address || t.mint) || null;
                       if(!mint) continue;
-                      const mask = eng.getMaskForMint(mint);
-                      const ledgerStrong = eng.isStrongSignal(mint);
+                      // prefer passing the numeric slot to the ledger engine when available
+                      try{ t.txSlot = typeof t.txSlot === 'undefined' ? (typeof txSlot !== 'undefined' ? txSlot : null) : t.txSlot; }catch(_e){}
+                      const mask = eng.getMaskForMint(mint, (typeof t.txSlot !== 'undefined' ? t.txSlot : null));
+                      const ledgerStrong = eng.isStrongSignal(mint, (typeof t.txSlot !== 'undefined' ? t.txSlot : null));
                       t.ledgerMask = mask;
                       t.ledgerStrong = !!ledgerStrong;
                       // if sampleLogs contain sollet-style hints, attach sollet flag
@@ -852,9 +914,48 @@ async function startSequentialListener(options){
                                           AUTO_EXEC_TOKEN_LOCKS.set(key, expiry);
                                         }
                                         (async () => {
-                                          try{ await autoExec(user, tokensToExec, 'buy'); }
-                                          catch(e){ try{ console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
-                                          finally{ try{ AUTO_EXEC_USER_LOCKS.delete(uidKey); }catch(_){}}
+                                          // reserve an idempotent execution key per token using mint|slot|sig
+                                          const reserved = [];
+                                          try{
+                                            const now = Date.now();
+                                            // cleanup expired idempotency entries
+                                            for(const [k, exp] of EXEC_IDEMPOTENCY.entries()){
+                                              if(!exp || exp <= now) EXEC_IDEMPOTENCY.delete(k);
+                                            }
+                                            // build reservation list mapping execKey -> addr
+                                            const toRun = [];
+                                            for(const t of tokensToExec){
+                                              try{
+                                                const keyAddr = (t && (t.address||t.tokenAddress||t.mint)) || String(t);
+                                                const execKey = `${keyAddr}:${sig || txBlock || ''}`;
+                                                // skip if already reserved or locked
+                                                if(EXEC_IDEMPOTENCY.has(execKey)) continue;
+                                                const addrLock = AUTO_EXEC_TOKEN_LOCKS.get(keyAddr);
+                                                if(addrLock && addrLock > now) continue;
+                                                // reserve
+                                                const lockMsInner = Number(process.env.AUTO_EXEC_TOKEN_LOCK_MS) || AUTO_EXEC_TOKEN_LOCK_MS;
+                                                const expiry = Date.now() + lockMsInner;
+                                                EXEC_IDEMPOTENCY.set(execKey, expiry);
+                                                AUTO_EXEC_TOKEN_LOCKS.set(keyAddr, expiry);
+                                                reserved.push({ execKey, keyAddr });
+                                                toRun.push(t);
+                                              }catch(_e){}
+                                            }
+                                            if(toRun.length === 0){ try{ console.error(`[listener:autoExec] user=${uidKey} tokens in-flight or reserved, skipping`); }catch(e){}; return; }
+                                            // Call autoExec with listener bypass so the executor treats this as low-latency hook
+                                            try{ await autoExec(user, toRun, 'buy', { listenerBypass: true, forceAllowSignal: true }); }
+                                            catch(e){ try{ console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
+                                          }catch(e){ try{ console.error('[listener:autoExec] reservation error', (e && e.message) || e); }catch(_){} }
+                                          finally{
+                                            // release user lock and reserved exec keys
+                                            try{ AUTO_EXEC_USER_LOCKS.delete(uidKey); }catch(_){}
+                                            try{
+                                              for(const r of reserved){
+                                                try{ EXEC_IDEMPOTENCY.delete(r.execKey); }catch(_e){}
+                                                try{ AUTO_EXEC_TOKEN_LOCKS.delete(r.keyAddr); }catch(_e){}
+                                              }
+                                            }catch(_e){}
+                                          }
                                         })();
                                       }
                                     }
@@ -899,6 +1000,12 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
   try{
     // helper: verbose Helius/debug logging (gate via env)
     const helDebug = (...a) => { try{ if(process && process.env && String(process.env.DEBUG_HELIUS).toLowerCase()==='true'){ console.error(...a); } }catch(e){} };
+    // extra collector debug gate
+    const collectDebug = (...a) => { try{ if(process && process.env && String(process.env.DEBUG_COLLECT).toLowerCase()==='true'){ console.error('[COLLECT_DBG]', ...a); } }catch(e){} };
+    // Require-first-signature matching toggle: set to 'false' to allow mismatches when RPC indexing lags
+    const REQUIRE_FIRST_SIG_MATCH = (process.env.REQUIRE_FIRST_SIG_MATCH === 'false') ? false : true;
+    // Allow accepting previously-seen mints if their first-seen time is older than this (seconds)
+    const PREV_SEEN_ALLOW_SECONDS = Number(process.env.PREV_SEEN_ALLOW_SECONDS || 30);
     for(const p of PROGRAMS){
       if(Date.now() > stopAt) break;
       try{
@@ -912,7 +1019,7 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
           // Try to determine kind; if absent, attempt per-mint "created-in-this-tx" fallback
           let kind = txKindExplicit(tx);
           const mints = extractMints(tx).filter(x=>x && !DENY.has(x));
-          if(!kind){
+            if(!kind){
             if(!mints || mints.length===0){ helDebug('collectFreshMints: skipping sig (no kind and no mints)', sig); continue; }
             // if any mint shows strong created-in-this-tx indicator, treat as initialize
             let anyCreated = false;
@@ -937,17 +1044,48 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
             // This avoids including tokens that only appear in swap flows or as references.
             try{
               const createdHere = isMintCreatedInThisTx(tx, m);
+              collectDebug('evaluating mint', m, 'createdHere=', !!createdHere, 'txSig=', sig, 'program=', p);
               if(!createdHere) {
                 // skip non-created-in-this-tx mints even if the tx kind is initialize
+                collectDebug('skipping non-created-in-this-tx mint', m, 'txSig=', sig);
                 continue;
               }
-              // require not previously seen
-              const prevInit = await mintPreviouslySeen(m, txBlock, sig);
+              // Require that the mint's first-known signature matches this tx's signature.
+              // This reduces false-positives where non-fresh addresses are referenced in an initialize.
+              try{
+                const firstSigObj = await getFirstSignatureCached(m).catch(()=>null);
+                const firstSig = firstSigObj && firstSigObj.sig ? firstSigObj.sig : null;
+                collectDebug('firstSigObj for', m, '=', firstSigObj);
+                if(REQUIRE_FIRST_SIG_MATCH){
+                  if(firstSig && firstSig !== sig){
+                    try{ console.error('collectFreshMints: rejecting mint because firstSig!=currentSig', m, 'firstSig=', firstSig, 'sig=', sig); }catch(_e){}
+                    continue;
+                  }
+                } else {
+                  if(firstSig && firstSig !== sig) collectDebug('firstSig mismatch allowed by REQUIRE_FIRST_SIG_MATCH=false for', m, 'firstSig=', firstSig, 'sig=', sig);
+                }
+              }catch(_e){}
+              // require not previously seen (fallback). Keep existing prev-check to avoid duplicates.
+              const txSlotLocal = (tx && (tx.slot || (tx.meta && tx.meta.slot))) || (s && (s.slot || s.blockSlot)) || null;
+              const prevInit = await mintPreviouslySeen(m, txSlotLocal, txBlock, sig);
+              collectDebug('mintPreviouslySeen result for', m, '=', prevInit);
               // Accept when not previously seen (false) or when unknown (null) to avoid dropping true positives
-              // during transient RPC failures/rate-limits. Only reject when prevInit === true.
+              // during transient RPC failures/rate-limits.
               if(prevInit === false || prevInit === null) accept = true;
               else {
-                try{ console.error('collectFreshMints: rejecting mint previously seen', m, 'sig=', sig); writeCollectorDebugDump('prevSeen', { program: p, mint: m, sig, txBlock, prev: prevInit }); }catch(e){}
+                // prevInit === true -> mint has prior signatures. Allow acceptance if the first-seen
+                // timestamp is older than PREV_SEEN_ALLOW_SECONDS (helps when previous sightings are stale).
+                try{
+                  let firstSigObj = await getFirstSignatureCached(m).catch(()=>null);
+                  const firstBlock = firstSigObj && firstSigObj.blockTime ? Number(firstSigObj.blockTime) : null;
+                  const tb = txBlock ? Number(txBlock) : null;
+                  if(firstBlock && tb && (tb - firstBlock) > PREV_SEEN_ALLOW_SECONDS){
+                    collectDebug('prevSeen but older than allow window; accepting', m, 'firstBlock=', firstBlock, 'txBlock=', tb, 'allowSec=', PREV_SEEN_ALLOW_SECONDS);
+                    accept = true;
+                  } else {
+                    try{ console.error('collectFreshMints: rejecting mint previously seen', m, 'sig=', sig); writeCollectorDebugDump('prevSeen', { program: p, mint: m, sig, txBlock, prev: prevInit }); }catch(e){}
+                  }
+                }catch(e){ try{ console.error('collectFreshMints: error while checking prevSeen acceptance', e && e.message || e); }catch(_e){} }
               }
             }catch(e){}
             if(accept){
@@ -955,6 +1093,7 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                 // validate that the candidate address is an on-chain SPL Mint
                 try{
                   const isMintOnChain = await isOnChainMintAddress(m);
+                  collectDebug('isOnChainMintAddress for', m, '=', isMintOnChain);
                   if(!isMintOnChain){
                     try{ console.error('collectFreshMints: skipping non-mint-on-chain address', m); }catch(e){}
                     continue;
@@ -976,6 +1115,8 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                   ageSeconds: ageSec,
                   firstBlock: ft,
                   txBlock: txBlock,
+                  // expose numeric slot when available for consumers/ledger engine
+                  slot: (tx && (tx.slot || (tx.meta && tx.meta.slot))) || (s && (s.slot || s.blockSlot)) || null,
                 };
                 try{
                   // Print the fresh mints array line first for the live-style output
@@ -995,6 +1136,7 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                   sourceSignature: sig,
                   kind: kind,
                   txBlock: txBlock,
+                  slot: (tx && (tx.slot || (tx.meta && tx.meta.slot))) || (s && (s.slot || s.blockSlot)) || null,
                   sampleLogs: (tx.meta && tx.meta.logMessages || []).slice(0,6),
                   __listenerCollected: true,
                 };
@@ -1002,8 +1144,9 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                   // Attach ledger-derived mask and a merged Sollet+Ledger signal for downstream consumers
                   if(typeof eng_bridge !== 'undefined' && eng_bridge && typeof eng_bridge.getMaskForMint === 'function'){
                     try{
-                      const mask = eng_bridge.getMaskForMint(m, txBlock);
-                      const ledgerStrong = eng_bridge.isStrongSignal(m, txBlock);
+                      const txSlotLocal = (tok && tok.slot) || null;
+                      const mask = eng_bridge.getMaskForMint(m, txSlotLocal);
+                      const ledgerStrong = eng_bridge.isStrongSignal(m, txSlotLocal);
                       const logsStr = (tok.sampleLogs && Array.isArray(tok.sampleLogs)) ? tok.sampleLogs.join('\n').toLowerCase() : (tok.sampleLogs || '').toString().toLowerCase();
                       const solletHere = !!(logsStr && (logsStr.includes('instruction: initializemint') || logsStr.includes('initialize mint') || logsStr.includes('initialize_mint') || logsStr.includes('createidempotent')));
                       tok.ledgerMask = mask;
